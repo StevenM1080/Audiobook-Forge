@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
 import sys
@@ -30,8 +31,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from audiobook_forge.media import probe_audio, supported_audio_files
-from audiobook_forge.models import Chapter, SUPPORTED_AUDIO_EXTENSIONS, natural_sort_key
+from audiobook_forge.cover import normalize_cover
+from audiobook_forge.media import common_tags, probe_audio, supported_audio_files
+from audiobook_forge.models import BookMetadata, Chapter, SUPPORTED_AUDIO_EXTENSIONS, natural_sort_key
+from audiobook_forge.project_io import load_project, save_project
 
 AUDIO_EXTENSIONS = SUPPORTED_AUDIO_EXTENSIONS
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -161,6 +164,7 @@ class ConversionWorker(QObject):
                 temp = Path(temp_dir)
                 concat_file = temp / "inputs.txt"
                 metadata_file = temp / "chapters.txt"
+                cover_for_encode = normalize_cover(self.cover, temp / "cover.jpg") if self.cover else None
                 durations: list[float] = []
                 concat_file.write_text("\n".join(f"file '{self._concat_path(path)}'" for path in self.files), encoding="utf-8")
                 for index, chapter in enumerate(self.chapters):
@@ -183,18 +187,18 @@ class ConversionWorker(QObject):
                 total_duration = sum(durations)
 
                 command = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file)]
-                if self.cover:
-                    command += ["-i", str(self.cover)]
+                if cover_for_encode:
+                    command += ["-i", str(cover_for_encode)]
                 command += ["-i", str(metadata_file), "-map", "0:a:0"]
-                if self.cover:
+                if cover_for_encode:
                     command += ["-map", "1:v:0"]
-                command += ["-map_metadata", "-1", "-map_metadata", "2" if self.cover else "1", "-map_chapters", "2" if self.cover else "1", "-c:a", "aac", "-b:a", f"{self.bitrate}k"]
+                command += ["-map_metadata", "-1", "-map_metadata", "2" if cover_for_encode else "1", "-map_chapters", "2" if cover_for_encode else "1", "-c:a", "aac", "-b:a", f"{self.bitrate}k"]
                 if self.channel_mode == "Force mono":
                     command += ["-ac", "1"]
                 elif self.channel_mode == "Force stereo":
                     command += ["-ac", "2"]
                 command += ["-nostats", "-progress", "pipe:1"]
-                if self.cover:
+                if cover_for_encode:
                     command += ["-c:v", "mjpeg", "-disposition:v:0", "attached_pic"]
                 command += [str(self.output)]
 
@@ -224,6 +228,14 @@ class ConversionWorker(QObject):
                     raise RuntimeError(f"FFmpeg failed with exit code {exit_code}.\n\n{detail[-4000:]}")
                 if not self.output.exists() or self.output.stat().st_size == 0:
                     raise RuntimeError("FFmpeg finished but the output file was empty.")
+                probe = Path(ffmpeg).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
+                if probe.exists():
+                    check = subprocess.run([str(probe), "-v", "error", "-show_entries", "format=duration:format_tags=title", "-show_chapters", "-of", "json", str(self.output)], capture_output=True, text=True)
+                    if check.returncode != 0:
+                        raise RuntimeError(f"Output validation failed:\n{check.stderr[-2000:]}")
+                    report = json.loads(check.stdout)
+                    if len(report.get("chapters", [])) != len(self.chapters):
+                        raise RuntimeError(f"Output validation failed: expected {len(self.chapters)} chapters, found {len(report.get('chapters', []))}.")
                 self.progress.emit(100, "Audiobook ready")
                 self.finished.emit(self.output)
         except Exception as error:
@@ -239,9 +251,28 @@ class MainWindow(QMainWindow):
         self.cover: Path | None = None
         self.thread: QThread | None = None
         self.worker: ConversionWorker | None = None
+        self.project_path: Path | None = None
         self.setWindowTitle("Freedom / Audiobook Forge")
         self.setMinimumSize(920, 640)
         self._build_ui()
+        self._build_menu()
+        self._restore_settings()
+
+    def _restore_settings(self) -> None:
+        geometry = self.settings.value("window_geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        self.quality_combo.setCurrentIndex(int(self.settings.value("bitrate_index", 1)))
+        self.channel_combo.setCurrentText(self.settings.value("channel_mode", "Preserve source"))
+
+    def _build_menu(self) -> None:
+        project_menu = self.menuBar().addMenu("Project")
+        project_menu.addAction("New Project", self.new_project)
+        project_menu.addAction("Open Project...", self.open_project)
+        project_menu.addAction("Save Project", self.save_project)
+        project_menu.addAction("Save Project As...", self.save_project_as)
+        tools_menu = self.menuBar().addMenu("Tools")
+        tools_menu.addAction("Choose FFmpeg...", self.choose_ffmpeg)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -379,12 +410,13 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLESHEET)
 
     def browse_audio(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(self, "Choose audio files", "", "Audio (*.mp3 *.m4a *.aac *.flac *.wav *.ogg)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Choose audio files", self.settings.value("input_directory", ""), "Audio (*.mp3 *.m4a *.aac *.flac *.wav *.ogg)")
         self.add_paths([Path(path) for path in paths])
 
     def browse_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose audiobook folder")
         if path:
+            self.settings.setValue("input_directory", path)
             self.add_paths([Path(path)])
 
     def add_paths(self, paths: list[Path]) -> None:
@@ -405,8 +437,19 @@ class MainWindow(QMainWindow):
             imported.append(chapter)
             existing.add(path)
         self._render_chapters()
-        if imported and not self.title_edit.text().strip():
-            self.title_edit.setText(self._common_tag(imported, "album"))
+        if imported:
+            tags = common_tags(imported)
+            candidates = {
+                "title": tags.get("album", ""),
+                "author": tags.get("albumartist", tags.get("artist", "")),
+                "composer": tags.get("composer", ""),
+                "date": tags.get("date", ""),
+                "genre": tags.get("genre", ""),
+            }
+            edits = {"title": self.title_edit, "author": self.author_edit, "composer": self.metadata_edits["composer"], "date": self.metadata_edits["date"], "genre": self.metadata_edits["genre"]}
+            for key, value in candidates.items():
+                if value and not edits[key].text().strip():
+                    edits[key].setText(value)
 
     def clear_files(self) -> None:
         self.chapters.clear()
@@ -463,10 +506,6 @@ class MainWindow(QMainWindow):
         total_seconds = max(0, int(seconds))
         return f"{total_seconds // 3600:02d}:{total_seconds % 3600 // 60:02d}:{total_seconds % 60:02d}"
 
-    @staticmethod
-    def _common_tag(chapters: list[Chapter], key: str) -> str:
-        return ""
-
     def _refresh_count(self) -> None:
         self.count_label.setText(f"{len(self.chapters)} CHAPTERS")
         total = sum(chapter.duration for chapter in self.chapters)
@@ -479,10 +518,72 @@ class MainWindow(QMainWindow):
             self.cover = Path(path)
             self.cover_drop.set_path(self.cover)
 
+    def choose_ffmpeg(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Choose ffmpeg executable", "", "FFmpeg executable (ffmpeg.exe)")
+        if path:
+            self.settings.setValue("ffmpeg_path", path)
+
+    def new_project(self) -> None:
+        self.clear_files()
+        for edit in self.metadata_edits.values():
+            edit.clear()
+        self.cover = None
+        self.output_edit.clear()
+        self.project_path = None
+
+    def save_project(self) -> None:
+        if self.project_path is None:
+            self.save_project_as()
+            return
+        self._write_project(self.project_path)
+
+    def save_project_as(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Save Audiobook Forge project", "audiobook-project.json", "Audiobook Forge project (*.json)")
+        if path:
+            self.project_path = Path(path)
+            self._write_project(self.project_path)
+
+    def _write_project(self, path: Path) -> None:
+        metadata = BookMetadata(
+            title=self.title_edit.text().strip(),
+            author=self.author_edit.text().strip(),
+            narrator=self.metadata_edits["composer"].text().strip(),
+            series=self.metadata_edits["grouping"].text().strip(),
+            series_number=self.metadata_edits["series_number"].text().strip(),
+            year=self.metadata_edits["date"].text().strip(),
+            genre=self.metadata_edits["genre"].text().strip(),
+        )
+        bitrate = [64, 96, 128, 160][self.quality_combo.currentIndex()]
+        save_project(path, self.chapters, metadata, self.cover, Path(self.output_edit.text()) if self.output_edit.text() else None, bitrate, self.channel_combo.currentText())
+
+    def open_project(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Open Audiobook Forge project", "", "Audiobook Forge project (*.json)")
+        if not path:
+            return
+        try:
+            payload = load_project(Path(path))
+            self.chapters = [Chapter(Path(item["path"]), item["title"], float(item["duration"]), item.get("track_number")) for item in payload["chapters"]]
+            self._render_chapters()
+            saved_metadata = payload.get("metadata", {})
+            self.title_edit.setText(saved_metadata.get("title", ""))
+            self.author_edit.setText(saved_metadata.get("author", ""))
+            for key, metadata_key in {"composer": "narrator", "grouping": "series", "series_number": "series_number", "date": "year", "genre": "genre"}.items():
+                self.metadata_edits[key].setText(saved_metadata.get(metadata_key, ""))
+            self.cover = Path(payload["cover"]) if payload.get("cover") else None
+            if self.cover and self.cover.exists():
+                self.cover_drop.set_path(self.cover)
+            self.output_edit.setText(payload.get("output", ""))
+            self.quality_combo.setCurrentIndex({64: 0, 96: 1, 128: 2, 160: 3}.get(payload.get("bitrate", 96), 1))
+            self.channel_combo.setCurrentText(payload.get("channel_mode", "Preserve source"))
+            self.project_path = Path(path)
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            QMessageBox.critical(self, "Could not open project", str(error))
+
     def browse_output(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Export audiobook", "audiobook.m4b", "M4B audiobook (*.m4b)")
+        path, _ = QFileDialog.getSaveFileName(self, "Export audiobook", self.settings.value("output_directory", "audiobook.m4b"), "M4B audiobook (*.m4b)")
         if path:
             self.output_edit.setText(path)
+            self.settings.setValue("output_directory", str(Path(path).parent))
 
     def convert(self) -> None:
         self._sync_chapters_from_list()
@@ -544,6 +645,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export in progress", "Wait for the audiobook export to finish before closing.")
             event.ignore()
             return
+        self.settings.setValue("window_geometry", self.saveGeometry())
+        self.settings.setValue("bitrate_index", self.quality_combo.currentIndex())
+        self.settings.setValue("channel_mode", self.channel_combo.currentText())
         event.accept()
 
     def conversion_finished(self, output: Path) -> None:

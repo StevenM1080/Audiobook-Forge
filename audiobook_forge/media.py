@@ -21,6 +21,17 @@ def probe_audio(path: Path) -> Chapter:
         raise ValueError(f"Could not read {path}: {error}") from error
 
 
+def common_tags(chapters: list[Chapter]) -> dict[str, str]:
+    values: dict[str, list[str]] = {}
+    for chapter in chapters:
+        audio = File(chapter.path, easy=True)
+        for key in ("album", "albumartist", "artist", "composer", "date", "genre"):
+            value = _first_tag(audio.tags if audio else None, key)
+            if value:
+                values.setdefault(key, []).append(value)
+    return {key: entries[0] for key, entries in values.items() if len(entries) == len(chapters) and len(set(entries)) == 1}
+
+
 def supported_audio_files(folder: Path) -> list[Path]:
     return [path for path in folder.iterdir() if path.is_file() and path.suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS]
 
