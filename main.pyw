@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtCore import QObject, QSettings, QThread, Qt, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -109,14 +110,16 @@ class ConversionWorker(QObject):
     failed = Signal(str)
     cancelled = Signal()
 
-    def __init__(self, chapters: list[Chapter], output: Path, title: str, author: str, cover: Path | None) -> None:
+    def __init__(self, chapters: list[Chapter], output: Path, metadata: dict[str, str], cover: Path | None, bitrate: int, channel_mode: str, ffmpeg_path: str | None) -> None:
         super().__init__()
         self.chapters = chapters
         self.files = [chapter.path for chapter in chapters]
         self.output = output
-        self.title = title
-        self.author = author
+        self.metadata = metadata
         self.cover = cover
+        self.bitrate = bitrate
+        self.channel_mode = channel_mode
+        self.ffmpeg_path = ffmpeg_path
         self.process: subprocess.Popen[str] | None = None
         self.cancel_requested = False
 
@@ -126,8 +129,13 @@ class ConversionWorker(QObject):
             self.process.terminate()
 
     @staticmethod
-    def _ffmpeg_path() -> str | None:
-        return shutil.which("ffmpeg") or str(Path.home() / ".spotdl" / "ffmpeg.exe")
+    def _ffmpeg_path(configured: str | None = None) -> str | None:
+        bundled = Path(sys.argv[0]).resolve().with_name("ffmpeg.exe")
+        candidates = [Path(configured)] if configured else []
+        system_path = shutil.which("ffmpeg")
+        candidates.extend([bundled, Path(system_path) if system_path else Path()])
+        candidates.append(Path.home() / ".spotdl" / "ffmpeg.exe")
+        return next((str(path) for path in candidates if path and path.exists()), None)
 
     @staticmethod
     def _metadata_value(value: str) -> str:
@@ -143,7 +151,7 @@ class ConversionWorker(QObject):
         return f"{total_seconds // 3600:02d}:{total_seconds % 3600 // 60:02d}:{total_seconds % 60:02d}"
 
     def run(self) -> None:
-        ffmpeg = self._ffmpeg_path()
+        ffmpeg = self._ffmpeg_path(self.ffmpeg_path)
         if not ffmpeg or not Path(ffmpeg).exists():
             self.failed.emit("ffmpeg was not found. Install ffmpeg and add it to PATH.")
             return
@@ -163,7 +171,10 @@ class ConversionWorker(QObject):
                     self.progress.emit(10 + int((index + 1) / len(self.files) * 30), f"Reading chapter {index + 1} of {len(self.files)}")
 
                 timestamp = 0
-                chapters = [";FFMETADATA1", f"title={self._metadata_value(self.title)}", f"artist={self._metadata_value(self.author)}", f"album={self._metadata_value(self.title)}"]
+                chapters = [";FFMETADATA1"]
+                for key, value in self.metadata.items():
+                    if value:
+                        chapters.append(f"{key}={self._metadata_value(value)}")
                 for index, (chapter, duration) in enumerate(zip(self.chapters, durations)):
                     start = timestamp
                     timestamp += max(1, round(duration * 1000))
@@ -177,7 +188,12 @@ class ConversionWorker(QObject):
                 command += ["-i", str(metadata_file), "-map", "0:a:0"]
                 if self.cover:
                     command += ["-map", "1:v:0"]
-                command += ["-map_metadata", "-1", "-map_metadata", "2" if self.cover else "1", "-map_chapters", "2" if self.cover else "1", "-c:a", "aac", "-b:a", "96k", "-nostats", "-progress", "pipe:1"]
+                command += ["-map_metadata", "-1", "-map_metadata", "2" if self.cover else "1", "-map_chapters", "2" if self.cover else "1", "-c:a", "aac", "-b:a", f"{self.bitrate}k"]
+                if self.channel_mode == "Force mono":
+                    command += ["-ac", "1"]
+                elif self.channel_mode == "Force stereo":
+                    command += ["-ac", "2"]
+                command += ["-nostats", "-progress", "pipe:1"]
                 if self.cover:
                     command += ["-c:v", "mjpeg", "-disposition:v:0", "attached_pic"]
                 command += [str(self.output)]
@@ -218,6 +234,7 @@ class ConversionWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        self.settings = QSettings("AudiobookForge", "AudiobookForge")
         self.chapters: list[Chapter] = []
         self.cover: Path | None = None
         self.thread: QThread | None = None
@@ -291,15 +308,28 @@ class MainWindow(QMainWindow):
         self.author_edit = QLineEdit()
         self.author_edit.setPlaceholderText("Author name")
         details.addWidget(self.author_edit, 1, 1)
-        details.addWidget(QLabel("Cover image"), 2, 0, Qt.AlignmentFlag.AlignTop)
+        self.metadata_edits: dict[str, QLineEdit] = {"title": self.title_edit, "artist": self.author_edit}
+        for row, key, label, placeholder in [
+            (2, "composer", "Narrator", "Narrator name"),
+            (3, "grouping", "Series", "Series name"),
+            (4, "series_number", "Series no.", "Optional"),
+            (5, "date", "Year", "YYYY"),
+            (6, "genre", "Genre", "Optional"),
+        ]:
+            details.addWidget(QLabel(label), row, 0)
+            edit = QLineEdit()
+            edit.setPlaceholderText(placeholder)
+            self.metadata_edits[key] = edit
+            details.addWidget(edit, row, 1)
+        details.addWidget(QLabel("Cover image"), 7, 0, Qt.AlignmentFlag.AlignTop)
         cover_row = QVBoxLayout()
         self.cover_drop = CoverDrop()
         cover_row.addWidget(self.cover_drop)
         cover_button = QPushButton("Browse image")
         cover_button.clicked.connect(self.browse_cover)
         cover_row.addWidget(cover_button)
-        details.addLayout(cover_row, 2, 1)
-        details.addWidget(QLabel("Export to"), 3, 0)
+        details.addLayout(cover_row, 7, 1)
+        details.addWidget(QLabel("Export to"), 8, 0)
         output_row = QHBoxLayout()
         self.output_edit = QLineEdit()
         self.output_edit.setPlaceholderText("Choose an output .m4b file")
@@ -307,12 +337,17 @@ class MainWindow(QMainWindow):
         output_button.clicked.connect(self.browse_output)
         output_row.addWidget(self.output_edit)
         output_row.addWidget(output_button)
-        details.addLayout(output_row, 3, 1)
-        details.addWidget(QLabel("Quality"), 4, 0)
+        details.addLayout(output_row, 8, 1)
+        details.addWidget(QLabel("Quality"), 9, 0)
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(["64 kbps  Small", "96 kbps  Standard", "128 kbps  High", "160 kbps  Very High"])
         self.quality_combo.setCurrentIndex(1)
-        details.addWidget(self.quality_combo, 4, 1)
+        details.addWidget(self.quality_combo, 9, 1)
+        self.quality_combo.currentIndexChanged.connect(self._refresh_count)
+        details.addWidget(QLabel("Channels"), 10, 0)
+        self.channel_combo = QComboBox()
+        self.channel_combo.addItems(["Preserve source", "Force mono", "Force stereo"])
+        details.addWidget(self.channel_combo, 10, 1)
         details.setColumnStretch(1, 1)
         splitter.addWidget(right)
         splitter.setSizes([470, 380])
@@ -467,7 +502,18 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(True)
         self.progress.setValue(0)
         self.thread = QThread(self)
-        self.worker = ConversionWorker(self.chapters, output, self.title_edit.text().strip(), self.author_edit.text().strip(), self.cover)
+        metadata = {key: edit.text().strip() for key, edit in self.metadata_edits.items()}
+        metadata["album"] = metadata.get("title", "")
+        bitrate = [64, 96, 128, 160][self.quality_combo.currentIndex()]
+        self.worker = ConversionWorker(
+            self.chapters,
+            output,
+            metadata,
+            self.cover,
+            bitrate,
+            self.channel_combo.currentText(),
+            self.settings.value("ffmpeg_path", "") or None,
+        )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(lambda value, message: (self.progress.setValue(value), self.status_label.setText(message)))
