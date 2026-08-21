@@ -1,6 +1,6 @@
 # Audiobook Forge
 
-A small PySide6 desktop app that combines ordered MP3 files into one chapterized M4B audiobook.
+A PySide6 desktop app for authoring a chapterized M4B audiobook from MP3, M4A, AAC, FLAC, WAV, or OGG files.
 
 ## Run
 
@@ -10,7 +10,7 @@ A small PySide6 desktop app that combines ordered MP3 files into one chapterized
    python -m pip install -r requirements.txt
    ```
 
-2. Make sure `ffmpeg` is available. The app also recognizes `%USERPROFILE%\.spotdl\ffmpeg.exe`; MP3 durations are read with Mutagen, so `ffprobe` is not required.
+2. Make sure `ffmpeg` is available. The app checks a bundled executable beside the app, a configured executable, system `PATH`, and `%USERPROFILE%\.spotdl\ffmpeg.exe`. Configure FFmpeg and FFprobe from the **Tools** menu when needed.
 
 3. Start the GUI:
 
@@ -18,4 +18,4 @@ A small PySide6 desktop app that combines ordered MP3 files into one chapterized
    python main.pyw
    ```
 
-Drop MP3s into the chapter list, drag rows to reorder them, enter the title and author, optionally add cover art, then choose an output path and export.
+Drop audio files or a complete audiobook folder into the chapter list. Use the sort control, drag rows for manual order, double-click chapter titles to edit them, enter book metadata, choose quality/channel settings, and export. Projects can be saved as JSON from the **Project** menu.

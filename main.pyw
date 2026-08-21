@@ -113,7 +113,7 @@ class ConversionWorker(QObject):
     failed = Signal(str)
     cancelled = Signal()
 
-    def __init__(self, chapters: list[Chapter], output: Path, metadata: dict[str, str], cover: Path | None, bitrate: int, channel_mode: str, ffmpeg_path: str | None) -> None:
+    def __init__(self, chapters: list[Chapter], output: Path, metadata: dict[str, str], cover: Path | None, bitrate: int, channel_mode: str, ffmpeg_path: str | None, ffprobe_path: str | None) -> None:
         super().__init__()
         self.chapters = chapters
         self.files = [chapter.path for chapter in chapters]
@@ -123,6 +123,7 @@ class ConversionWorker(QObject):
         self.bitrate = bitrate
         self.channel_mode = channel_mode
         self.ffmpeg_path = ffmpeg_path
+        self.ffprobe_path = ffprobe_path
         self.process: subprocess.Popen[str] | None = None
         self.cancel_requested = False
 
@@ -136,7 +137,8 @@ class ConversionWorker(QObject):
         bundled = Path(sys.argv[0]).resolve().with_name("ffmpeg.exe")
         candidates = [Path(configured)] if configured else []
         system_path = shutil.which("ffmpeg")
-        candidates.extend([bundled, Path(system_path) if system_path else Path()])
+        if system_path:
+            candidates.append(Path(system_path))
         candidates.append(Path.home() / ".spotdl" / "ffmpeg.exe")
         return next((str(path) for path in candidates if path and path.exists()), None)
 
@@ -228,7 +230,7 @@ class ConversionWorker(QObject):
                     raise RuntimeError(f"FFmpeg failed with exit code {exit_code}.\n\n{detail[-4000:]}")
                 if not self.output.exists() or self.output.stat().st_size == 0:
                     raise RuntimeError("FFmpeg finished but the output file was empty.")
-                probe = Path(ffmpeg).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
+                probe = Path(self.ffprobe_path) if self.ffprobe_path else Path(ffmpeg).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
                 if probe.exists():
                     check = subprocess.run([str(probe), "-v", "error", "-show_entries", "format=duration:format_tags=title", "-show_chapters", "-of", "json", str(self.output)], capture_output=True, text=True)
                     if check.returncode != 0:
@@ -273,6 +275,7 @@ class MainWindow(QMainWindow):
         project_menu.addAction("Save Project As...", self.save_project_as)
         tools_menu = self.menuBar().addMenu("Tools")
         tools_menu.addAction("Choose FFmpeg...", self.choose_ffmpeg)
+        tools_menu.addAction("Choose FFprobe...", self.choose_ffprobe)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -305,7 +308,7 @@ class MainWindow(QMainWindow):
         self.file_list = DropList()
         self.file_list.paths_dropped.connect(self.add_paths)
         self.file_list.itemChanged.connect(self._chapter_title_changed)
-        self.file_list.model().rowsMoved.connect(lambda *_: self._sync_chapters_from_list())
+        self.file_list.model().rowsMoved.connect(self._manual_reorder)
         left_layout.addWidget(self.file_list)
         hint = QLabel("Drop audio files or a folder. Double-click titles to edit.")
         hint.setObjectName("hint")
@@ -323,6 +326,11 @@ class MainWindow(QMainWindow):
         row.addWidget(add_button)
         row.addWidget(folder_button)
         row.addWidget(remove_button)
+        row.addWidget(QLabel("Sort:"))
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems(["Natural filename", "Track number", "Manual order"])
+        self.sort_combo.currentIndexChanged.connect(self.apply_sort)
+        row.addWidget(self.sort_combo)
         row.addStretch()
         row.addWidget(clear_button)
         left_layout.addLayout(row)
@@ -437,6 +445,7 @@ class MainWindow(QMainWindow):
             imported.append(chapter)
             existing.add(path)
         self._render_chapters()
+        self.sort_combo.setCurrentIndex(0)
         if imported:
             tags = common_tags(imported)
             candidates = {
@@ -496,6 +505,20 @@ class MainWindow(QMainWindow):
         self._renumber_rows()
         self._refresh_count()
 
+    def apply_sort(self, index: int) -> None:
+        self._sync_chapters_from_list()
+        if index == 0:
+            self.chapters.sort(key=lambda chapter: natural_sort_key(chapter.path))
+        elif index == 1:
+            self.chapters.sort(key=lambda chapter: (chapter.track_number is None, chapter.track_number or 0, natural_sort_key(chapter.path)))
+        self._render_chapters()
+
+    def _manual_reorder(self, *_args) -> None:
+        self._sync_chapters_from_list()
+        self.sort_combo.blockSignals(True)
+        self.sort_combo.setCurrentIndex(2)
+        self.sort_combo.blockSignals(False)
+
     def _chapter_title_changed(self, item: QListWidgetItem) -> None:
         title = item.text().split("   ", 1)[-1].rsplit("   ", 1)[0].strip()
         item.setData(Qt.ItemDataRole.UserRole + 2, title)
@@ -522,6 +545,11 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Choose ffmpeg executable", "", "FFmpeg executable (ffmpeg.exe)")
         if path:
             self.settings.setValue("ffmpeg_path", path)
+
+    def choose_ffprobe(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Choose ffprobe executable", "", "FFprobe executable (ffprobe.exe)")
+        if path:
+            self.settings.setValue("ffprobe_path", path)
 
     def new_project(self) -> None:
         self.clear_files()
@@ -598,6 +626,16 @@ class MainWindow(QMainWindow):
             choice = QMessageBox.question(self, "Output already exists", f"Replace this file?\n{output}", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if choice != QMessageBox.StandardButton.Yes:
                 return
+        bitrate = [64, 96, 128, 160][self.quality_combo.currentIndex()]
+        estimate = int(sum(chapter.duration for chapter in self.chapters) * bitrate * 1000 / 8)
+        try:
+            free_space = shutil.disk_usage(output.parent.resolve()).free
+        except OSError:
+            free_space = estimate * 2
+        if free_space < estimate * 1.5:
+            choice = QMessageBox.warning(self, "Low disk space", f"The destination may not have enough free space for this export.\nEstimated output: {estimate / 1_000_000:.0f} MB", QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+            if choice != QMessageBox.StandardButton.Ok:
+                return
         self.output_edit.setText(str(output))
         self.convert_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
@@ -605,7 +643,6 @@ class MainWindow(QMainWindow):
         self.thread = QThread(self)
         metadata = {key: edit.text().strip() for key, edit in self.metadata_edits.items()}
         metadata["album"] = metadata.get("title", "")
-        bitrate = [64, 96, 128, 160][self.quality_combo.currentIndex()]
         self.worker = ConversionWorker(
             self.chapters,
             output,
@@ -614,6 +651,7 @@ class MainWindow(QMainWindow):
             bitrate,
             self.channel_combo.currentText(),
             self.settings.value("ffmpeg_path", "") or None,
+            self.settings.value("ffprobe_path", "") or None,
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
