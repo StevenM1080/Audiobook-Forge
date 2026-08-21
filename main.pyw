@@ -107,6 +107,7 @@ class ConversionWorker(QObject):
     progress = Signal(int, str)
     finished = Signal(Path)
     failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, chapters: list[Chapter], output: Path, title: str, author: str, cover: Path | None) -> None:
         super().__init__()
@@ -116,6 +117,13 @@ class ConversionWorker(QObject):
         self.title = title
         self.author = author
         self.cover = cover
+        self.process: subprocess.Popen[str] | None = None
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
 
     @staticmethod
     def _ffmpeg_path() -> str | None:
@@ -148,6 +156,9 @@ class ConversionWorker(QObject):
                 durations: list[float] = []
                 concat_file.write_text("\n".join(f"file '{self._concat_path(path)}'" for path in self.files), encoding="utf-8")
                 for index, chapter in enumerate(self.chapters):
+                    if self.cancel_requested:
+                        self.cancelled.emit()
+                        return
                     durations.append(chapter.duration)
                     self.progress.emit(10 + int((index + 1) / len(self.files) * 30), f"Reading chapter {index + 1} of {len(self.files)}")
 
@@ -173,18 +184,34 @@ class ConversionWorker(QObject):
 
                 total_label = self._format_time(total_duration)
                 self.progress.emit(45, f"Processed audio: 00:00:00 / {total_label}")
-                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                if process.stdout:
-                    for line in process.stdout:
+                self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                diagnostics: list[str] = []
+                if self.process.stdout:
+                    for line in self.process.stdout:
+                        diagnostics.append(line.rstrip())
+                        del diagnostics[:-40]
+                        if self.cancel_requested:
+                            self.process.terminate()
+                            break
                         if line.startswith("out_time_ms=") and total_duration:
                             elapsed = int(line.split("=", 1)[1]) / 1_000_000
                             percent = 45 + int(min(50, elapsed / total_duration * 50))
                             self.progress.emit(percent, f"Processed audio: {self._format_time(elapsed)} / {total_label}")
-                if process.wait() != 0:
-                    raise RuntimeError("ffmpeg could not create the M4B file.")
+                exit_code = self.process.wait()
+                self.process = None
+                if self.cancel_requested:
+                    self.output.unlink(missing_ok=True)
+                    self.cancelled.emit()
+                    return
+                if exit_code != 0:
+                    detail = "\n".join(line for line in diagnostics if line and not line.startswith(("frame=", "out_", "progress=")))
+                    raise RuntimeError(f"FFmpeg failed with exit code {exit_code}.\n\n{detail[-4000:]}")
+                if not self.output.exists() or self.output.stat().st_size == 0:
+                    raise RuntimeError("FFmpeg finished but the output file was empty.")
                 self.progress.emit(100, "Audiobook ready")
                 self.finished.emit(self.output)
         except Exception as error:
+            self.output.unlink(missing_ok=True)
             self.failed.emit(str(error))
 
 
@@ -303,6 +330,11 @@ class MainWindow(QMainWindow):
         self.progress.setTextVisible(False)
         self.progress.setFixedWidth(180)
         footer.addWidget(self.progress)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setObjectName("quietButton")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_conversion)
+        footer.addWidget(self.cancel_button)
         self.convert_button = QPushButton("MAKE M4B  →")
         self.convert_button.setObjectName("convertButton")
         self.convert_button.clicked.connect(self.convert)
@@ -426,8 +458,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Missing details", "Add a title and author before exporting.")
             return
         output = Path(self.output_edit.text().strip()) if self.output_edit.text().strip() else self.chapters[0].path.with_name(f"{self.title_edit.text().strip()}.m4b")
+        if output.exists():
+            choice = QMessageBox.question(self, "Output already exists", f"Replace this file?\n{output}", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if choice != QMessageBox.StandardButton.Yes:
+                return
         self.output_edit.setText(str(output))
         self.convert_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
         self.progress.setValue(0)
         self.thread = QThread(self)
         self.worker = ConversionWorker(self.chapters, output, self.title_edit.text().strip(), self.author_edit.text().strip(), self.cover)
@@ -436,16 +473,25 @@ class MainWindow(QMainWindow):
         self.worker.progress.connect(lambda value, message: (self.progress.setValue(value), self.status_label.setText(message)))
         self.worker.finished.connect(self.conversion_finished)
         self.worker.failed.connect(self.conversion_failed)
+        self.worker.cancelled.connect(self.conversion_cancelled)
         self.worker.finished.connect(self.thread.quit)
         self.worker.failed.connect(self.thread.quit)
+        self.worker.cancelled.connect(self.thread.quit)
         self.thread.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self._conversion_thread_finished)
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
+    def cancel_conversion(self) -> None:
+        if self.worker:
+            self.cancel_button.setEnabled(False)
+            self.status_label.setText("Cancelling export...")
+            self.worker.cancel()
+
     def _conversion_thread_finished(self) -> None:
         self.worker = None
         self.thread = None
+        self.cancel_button.setEnabled(False)
 
     def closeEvent(self, event) -> None:
         if self.thread and self.thread.isRunning():
@@ -464,6 +510,11 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.status_label.setText("Export failed")
         QMessageBox.critical(self, "Could not export", message)
+
+    def conversion_cancelled(self) -> None:
+        self.convert_button.setEnabled(True)
+        self.progress.setValue(0)
+        self.status_label.setText("Export cancelled")
 
 
 STYLESHEET = """
