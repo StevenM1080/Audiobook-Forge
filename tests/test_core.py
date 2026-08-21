@@ -25,9 +25,9 @@ def test_natural_sort_key_orders_numbers_numerically() -> None:
 
 
 def test_metadata_escaping() -> None:
-    value = r"a=b;c#d\\e\nf"
+    value = "a=b;c#d\\e\nf"
     escaped = ConversionWorker._metadata_value(value)
-    assert escaped == r"a\\=b\\;c\\#d\\\\e\\nf"
+    assert escaped == "a\\=b\\;c\\#d\\\\e\\nf"
 
 
 def test_output_estimate() -> None:
