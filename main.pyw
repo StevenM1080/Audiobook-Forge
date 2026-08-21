@@ -6,7 +6,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from mutagen.mp3 import MP3
 from PySide6.QtCore import QObject, QThread, Qt, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QPixmap
 from PySide6.QtWidgets import (
@@ -24,17 +23,21 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QComboBox,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
-AUDIO_EXTENSIONS = {".mp3"}
+from audiobook_forge.media import probe_audio, supported_audio_files
+from audiobook_forge.models import Chapter, SUPPORTED_AUDIO_EXTENSIONS, natural_sort_key
+
+AUDIO_EXTENSIONS = SUPPORTED_AUDIO_EXTENSIONS
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 class DropList(QListWidget):
-    files_dropped = Signal(list)
+    paths_dropped = Signal(list)
 
     def __init__(self) -> None:
         super().__init__()
@@ -54,9 +57,10 @@ class DropList(QListWidget):
 
     def dropEvent(self, event: QDropEvent) -> None:
         paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
-        audio_paths = [path for path in paths if path.suffix.lower() in AUDIO_EXTENSIONS]
-        if audio_paths:
-            self.files_dropped.emit(audio_paths)
+        audio_paths = [path for path in paths if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS]
+        folders = [path for path in paths if path.is_dir()]
+        if audio_paths or folders:
+            self.paths_dropped.emit(audio_paths + folders)
             event.acceptProposedAction()
         else:
             super().dropEvent(event)
@@ -104,9 +108,10 @@ class ConversionWorker(QObject):
     finished = Signal(Path)
     failed = Signal(str)
 
-    def __init__(self, files: list[Path], output: Path, title: str, author: str, cover: Path | None) -> None:
+    def __init__(self, chapters: list[Chapter], output: Path, title: str, author: str, cover: Path | None) -> None:
         super().__init__()
-        self.files = files
+        self.chapters = chapters
+        self.files = [chapter.path for chapter in chapters]
         self.output = output
         self.title = title
         self.author = author
@@ -115,10 +120,6 @@ class ConversionWorker(QObject):
     @staticmethod
     def _ffmpeg_path() -> str | None:
         return shutil.which("ffmpeg") or str(Path.home() / ".spotdl" / "ffmpeg.exe")
-
-    @staticmethod
-    def _duration(path: Path) -> float:
-        return float(MP3(path).info.length)
 
     @staticmethod
     def _metadata_value(value: str) -> str:
@@ -146,16 +147,16 @@ class ConversionWorker(QObject):
                 metadata_file = temp / "chapters.txt"
                 durations: list[float] = []
                 concat_file.write_text("\n".join(f"file '{self._concat_path(path)}'" for path in self.files), encoding="utf-8")
-                for index, path in enumerate(self.files):
-                    durations.append(self._duration(path))
+                for index, chapter in enumerate(self.chapters):
+                    durations.append(chapter.duration)
                     self.progress.emit(10 + int((index + 1) / len(self.files) * 30), f"Reading chapter {index + 1} of {len(self.files)}")
 
                 timestamp = 0
                 chapters = [";FFMETADATA1", f"title={self._metadata_value(self.title)}", f"artist={self._metadata_value(self.author)}", f"album={self._metadata_value(self.title)}"]
-                for index, (path, duration) in enumerate(zip(self.files, durations)):
+                for index, (chapter, duration) in enumerate(zip(self.chapters, durations)):
                     start = timestamp
                     timestamp += max(1, round(duration * 1000))
-                    chapters.extend(["[CHAPTER]", "TIMEBASE=1/1000", f"START={start}", f"END={timestamp}", f"title={self._metadata_value(path.stem)}"])
+                    chapters.extend(["[CHAPTER]", "TIMEBASE=1/1000", f"START={start}", f"END={timestamp}", f"title={self._metadata_value(chapter.title)}"])
                 metadata_file.write_text("\n".join(chapters), encoding="utf-8")
                 total_duration = sum(durations)
 
@@ -190,7 +191,7 @@ class ConversionWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.files: list[Path] = []
+        self.chapters: list[Chapter] = []
         self.cover: Path | None = None
         self.thread: QThread | None = None
         self.worker: ConversionWorker | None = None
@@ -227,18 +228,26 @@ class MainWindow(QMainWindow):
         left = QGroupBox("CHAPTERS")
         left_layout = QVBoxLayout(left)
         self.file_list = DropList()
-        self.file_list.files_dropped.connect(self.add_files)
+        self.file_list.paths_dropped.connect(self.add_paths)
+        self.file_list.itemChanged.connect(self._chapter_title_changed)
+        self.file_list.model().rowsMoved.connect(lambda *_: self._sync_chapters_from_list())
         left_layout.addWidget(self.file_list)
-        hint = QLabel("Drop MP3 files here. Drag rows to reorder.")
+        hint = QLabel("Drop audio files or a folder. Double-click titles to edit.")
         hint.setObjectName("hint")
         left_layout.addWidget(hint)
         row = QHBoxLayout()
-        add_button = QPushButton("+  Add MP3s")
+        add_button = QPushButton("+  Add files")
         add_button.clicked.connect(self.browse_audio)
+        folder_button = QPushButton("Add folder")
+        folder_button.clicked.connect(self.browse_folder)
+        remove_button = QPushButton("Remove selected")
+        remove_button.clicked.connect(self.remove_selected)
         clear_button = QPushButton("Clear")
         clear_button.setObjectName("quietButton")
         clear_button.clicked.connect(self.clear_files)
         row.addWidget(add_button)
+        row.addWidget(folder_button)
+        row.addWidget(remove_button)
         row.addStretch()
         row.addWidget(clear_button)
         left_layout.addLayout(row)
@@ -272,6 +281,11 @@ class MainWindow(QMainWindow):
         output_row.addWidget(self.output_edit)
         output_row.addWidget(output_button)
         details.addLayout(output_row, 3, 1)
+        details.addWidget(QLabel("Quality"), 4, 0)
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItems(["64 kbps  Small", "96 kbps  Standard", "128 kbps  High", "160 kbps  Very High"])
+        self.quality_combo.setCurrentIndex(1)
+        details.addWidget(self.quality_combo, 4, 1)
         details.setColumnStretch(1, 1)
         splitter.addWidget(right)
         splitter.setSizes([470, 380])
@@ -280,6 +294,9 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Ready when you are.")
         self.status_label.setObjectName("status")
         footer.addWidget(self.status_label, 1)
+        self.runtime_label = QLabel("Runtime: 00:00:00  |  Estimated output: ~0 MB")
+        self.runtime_label.setObjectName("status")
+        footer.addWidget(self.runtime_label)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -295,27 +312,99 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLESHEET)
 
     def browse_audio(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(self, "Choose MP3 files", "", "MP3 audio (*.mp3)")
-        self.add_files([Path(path) for path in paths])
+        paths, _ = QFileDialog.getOpenFileNames(self, "Choose audio files", "", "Audio (*.mp3 *.m4a *.aac *.flac *.wav *.ogg)")
+        self.add_paths([Path(path) for path in paths])
 
-    def add_files(self, paths: list[Path]) -> None:
-        existing = set(self.files)
+    def browse_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose audiobook folder")
+        if path:
+            self.add_paths([Path(path)])
+
+    def add_paths(self, paths: list[Path]) -> None:
+        files = []
         for path in paths:
-            if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS and path not in existing:
-                self.files.append(path)
-                item = QListWidgetItem(f"{len(self.files):02d}   {path.stem}")
-                item.setData(Qt.ItemDataRole.UserRole, path)
-                self.file_list.addItem(item)
-                existing.add(path)
-        self._refresh_count()
+            files.extend(supported_audio_files(path) if path.is_dir() else [path])
+        existing = {chapter.path for chapter in self.chapters}
+        imported: list[Chapter] = []
+        for path in sorted(files, key=natural_sort_key):
+            if path in existing:
+                continue
+            try:
+                chapter = probe_audio(path)
+            except ValueError as error:
+                QMessageBox.warning(self, "Could not read audio", str(error))
+                continue
+            self.chapters.append(chapter)
+            imported.append(chapter)
+            existing.add(path)
+        self._render_chapters()
+        if imported and not self.title_edit.text().strip():
+            self.title_edit.setText(self._common_tag(imported, "album"))
 
     def clear_files(self) -> None:
-        self.files.clear()
+        self.chapters.clear()
         self.file_list.clear()
         self._refresh_count()
 
+    def remove_selected(self) -> None:
+        selected = {item.data(Qt.ItemDataRole.UserRole) for item in self.file_list.selectedItems()}
+        self.chapters = [chapter for chapter in self.chapters if chapter.path not in selected]
+        self._render_chapters()
+
+    def _render_chapters(self) -> None:
+        self.file_list.blockSignals(True)
+        self.file_list.clear()
+        for chapter in self.chapters:
+            item = QListWidgetItem()
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+            item.setText(chapter.title)
+            item.setData(Qt.ItemDataRole.UserRole, chapter.path)
+            item.setData(Qt.ItemDataRole.UserRole + 1, chapter.duration)
+            item.setData(Qt.ItemDataRole.UserRole + 2, chapter.title)
+            self.file_list.addItem(item)
+        self.file_list.blockSignals(False)
+        self._renumber_rows()
+        self._refresh_count()
+
+    def _renumber_rows(self) -> None:
+        for index in range(self.file_list.count()):
+            item = self.file_list.item(index)
+            duration = float(item.data(Qt.ItemDataRole.UserRole + 1) or 0)
+            title = item.data(Qt.ItemDataRole.UserRole + 2) or item.text()
+            item.setText(f"{index + 1:02d}   {title}   {self._format_time(duration)}")
+
+    def _sync_chapters_from_list(self) -> None:
+        chapters_by_path = {chapter.path: chapter for chapter in self.chapters}
+        ordered = []
+        for index in range(self.file_list.count()):
+            item = self.file_list.item(index)
+            path = item.data(Qt.ItemDataRole.UserRole)
+            chapter = chapters_by_path[path]
+            chapter.title = str(item.data(Qt.ItemDataRole.UserRole + 2) or item.text()).strip()
+            ordered.append(chapter)
+        self.chapters = ordered
+        self._renumber_rows()
+        self._refresh_count()
+
+    def _chapter_title_changed(self, item: QListWidgetItem) -> None:
+        title = item.text().split("   ", 1)[-1].rsplit("   ", 1)[0].strip()
+        item.setData(Qt.ItemDataRole.UserRole + 2, title)
+        self._sync_chapters_from_list()
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        total_seconds = max(0, int(seconds))
+        return f"{total_seconds // 3600:02d}:{total_seconds % 3600 // 60:02d}:{total_seconds % 60:02d}"
+
+    @staticmethod
+    def _common_tag(chapters: list[Chapter], key: str) -> str:
+        return ""
+
     def _refresh_count(self) -> None:
-        self.count_label.setText(f"{len(self.files)} CHAPTERS")
+        self.count_label.setText(f"{len(self.chapters)} CHAPTERS")
+        total = sum(chapter.duration for chapter in self.chapters)
+        bitrate = [64, 96, 128, 160][self.quality_combo.currentIndex()] if hasattr(self, "quality_combo") else 96
+        self.runtime_label.setText(f"Runtime: {self._format_time(total)}  |  Estimated output: ~{total * bitrate * 1000 / 8 / 1_000_000:.0f} MB")
 
     def browse_cover(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Choose cover image", "", "Images (*.jpg *.jpeg *.png *.webp)")
@@ -329,19 +418,19 @@ class MainWindow(QMainWindow):
             self.output_edit.setText(path)
 
     def convert(self) -> None:
-        self.files = [self.file_list.item(index).data(Qt.ItemDataRole.UserRole) for index in range(self.file_list.count())]
-        if not self.files:
+        self._sync_chapters_from_list()
+        if not self.chapters:
             QMessageBox.warning(self, "No chapters", "Drop at least one MP3 file before exporting.")
             return
         if not self.title_edit.text().strip() or not self.author_edit.text().strip():
             QMessageBox.warning(self, "Missing details", "Add a title and author before exporting.")
             return
-        output = Path(self.output_edit.text().strip()) if self.output_edit.text().strip() else self.files[0].with_name(f"{self.title_edit.text().strip()}.m4b")
+        output = Path(self.output_edit.text().strip()) if self.output_edit.text().strip() else self.chapters[0].path.with_name(f"{self.title_edit.text().strip()}.m4b")
         self.output_edit.setText(str(output))
         self.convert_button.setEnabled(False)
         self.progress.setValue(0)
         self.thread = QThread(self)
-        self.worker = ConversionWorker(self.files, output, self.title_edit.text().strip(), self.author_edit.text().strip(), self.cover)
+        self.worker = ConversionWorker(self.chapters, output, self.title_edit.text().strip(), self.author_edit.text().strip(), self.cover)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(lambda value, message: (self.progress.setValue(value), self.status_label.setText(message)))
