@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-import os
-import json
 import shutil
-import subprocess
-import sys
-import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QSettings, QThread, Qt, Signal
@@ -31,9 +26,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from audiobook_forge.cover import normalize_cover
+from audiobook_forge.exporter import ExportCancelled, ExportEngine, format_time, metadata_value
 from audiobook_forge.media import common_tags, probe_audio, supported_audio_files
-from audiobook_forge.models import BookMetadata, Chapter, SUPPORTED_AUDIO_EXTENSIONS, natural_sort_key
+from audiobook_forge.models import (
+    BookMetadata,
+    Chapter,
+    SUPPORTED_AUDIO_EXTENSIONS,
+    estimate_output_bytes,
+    natural_sort_key,
+    safe_output_stem,
+)
 from audiobook_forge.project_io import load_project, save_project
 
 AUDIO_EXTENSIONS = SUPPORTED_AUDIO_EXTENSIONS
@@ -53,11 +55,20 @@ class DropList(QListWidget):
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
+        elif event.mimeData().hasFormat("application/x-qabstractitemmodeldatalist"):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
         else:
-            event.ignore()
+            super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event: QDragEnterEvent) -> None:
-        event.acceptProposedAction()
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        elif event.mimeData().hasFormat("application/x-qabstractitemmodeldatalist"):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            super().dragMoveEvent(event)
 
     def dropEvent(self, event: QDropEvent) -> None:
         paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
@@ -94,14 +105,25 @@ class CoverDrop(QFrame):
             self.preview.setText(path.name)
         self.path_changed.emit(path)
 
+    def clear(self) -> None:
+        self.path = None
+        self.preview.clear()
+        self.preview.setText("DROP COVER ART\nOR BROWSE")
+
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls() and any(Path(url.toLocalFile()).suffix.lower() in IMAGE_EXTENSIONS for url in event.mimeData().urls()):
+        if event.mimeData().hasUrls() and any(
+            Path(url.toLocalFile()).is_file()
+            and Path(url.toLocalFile()).suffix.lower() in IMAGE_EXTENSIONS
+            for url in event.mimeData().urls()
+        ):
             event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def dropEvent(self, event: QDropEvent) -> None:
         for url in event.mimeData().urls():
             path = Path(url.toLocalFile())
-            if path.suffix.lower() in IMAGE_EXTENSIONS:
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
                 self.set_path(path)
                 event.acceptProposedAction()
                 return
@@ -115,167 +137,79 @@ class ConversionWorker(QObject):
 
     def __init__(self, chapters: list[Chapter], output: Path, metadata: dict[str, str], cover: Path | None, bitrate: int, channel_mode: str, ffmpeg_path: str | None, ffprobe_path: str | None) -> None:
         super().__init__()
-        self.chapters = chapters
-        self.files = [chapter.path for chapter in chapters]
-        self.output = output
-        self.metadata = metadata
-        self.cover = cover
-        self.bitrate = bitrate
-        self.channel_mode = channel_mode
-        self.ffmpeg_path = ffmpeg_path
-        self.ffprobe_path = ffprobe_path
-        self.process: subprocess.Popen[str] | None = None
-        self.cancel_requested = False
+        self.engine = ExportEngine(
+            chapters,
+            output,
+            metadata,
+            cover,
+            bitrate,
+            channel_mode,
+            ffmpeg_path,
+            ffprobe_path,
+            self.progress.emit,
+        )
 
     def cancel(self) -> None:
-        self.cancel_requested = True
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-
-    @staticmethod
-    def _ffmpeg_path(configured: str | None = None) -> str | None:
-        bundled = Path(sys.argv[0]).resolve().with_name("ffmpeg.exe")
-        candidates = [Path(configured)] if configured else []
-        system_path = shutil.which("ffmpeg")
-        if system_path:
-            candidates.append(Path(system_path))
-        candidates.append(Path.home() / ".spotdl" / "ffmpeg.exe")
-        return next((str(path) for path in candidates if path and path.exists()), None)
+        self.engine.cancel()
 
     @staticmethod
     def _metadata_value(value: str) -> str:
-        return value.replace("\\", "\\\\").replace("=", "\\=").replace(";", "\\;").replace("#", "\\#").replace("\n", "\\n")
-
-    @staticmethod
-    def _concat_path(path: Path) -> str:
-        return str(path.resolve()).replace("\\", "/").replace("'", "'\\''")
-
-    @staticmethod
-    def _format_time(seconds: float) -> str:
-        total_seconds = max(0, int(seconds))
-        return f"{total_seconds // 3600:02d}:{total_seconds % 3600 // 60:02d}:{total_seconds % 60:02d}"
+        return metadata_value(value)
 
     def run(self) -> None:
-        ffmpeg = self._ffmpeg_path(self.ffmpeg_path)
-        if not ffmpeg or not Path(ffmpeg).exists():
-            self.failed.emit("ffmpeg was not found. Install ffmpeg and add it to PATH.")
-            return
-
         try:
-            with tempfile.TemporaryDirectory(prefix="freedom_m4b_") as temp_dir:
-                temp = Path(temp_dir)
-                concat_file = temp / "inputs.txt"
-                metadata_file = temp / "chapters.txt"
-                cover_for_encode = normalize_cover(self.cover, temp / "cover.jpg") if self.cover else None
-                durations: list[float] = []
-                concat_file.write_text("\n".join(f"file '{self._concat_path(path)}'" for path in self.files), encoding="utf-8")
-                for index, chapter in enumerate(self.chapters):
-                    if self.cancel_requested:
-                        self.cancelled.emit()
-                        return
-                    durations.append(chapter.duration)
-                    self.progress.emit(10 + int((index + 1) / len(self.files) * 30), f"Reading chapter {index + 1} of {len(self.files)}")
-
-                timestamp = 0
-                chapters = [";FFMETADATA1"]
-                for key, value in self.metadata.items():
-                    if value:
-                        chapters.append(f"{key}={self._metadata_value(value)}")
-                for index, (chapter, duration) in enumerate(zip(self.chapters, durations)):
-                    start = timestamp
-                    timestamp += max(1, round(duration * 1000))
-                    chapters.extend(["[CHAPTER]", "TIMEBASE=1/1000", f"START={start}", f"END={timestamp}", f"title={self._metadata_value(chapter.title)}"])
-                metadata_file.write_text("\n".join(chapters), encoding="utf-8")
-                total_duration = sum(durations)
-
-                command = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file)]
-                if cover_for_encode:
-                    command += ["-i", str(cover_for_encode)]
-                command += ["-i", str(metadata_file), "-map", "0:a:0"]
-                if cover_for_encode:
-                    command += ["-map", "1:v:0"]
-                command += ["-map_metadata", "-1", "-map_metadata", "2" if cover_for_encode else "1", "-map_chapters", "2" if cover_for_encode else "1", "-c:a", "aac", "-b:a", f"{self.bitrate}k"]
-                if self.channel_mode == "Force mono":
-                    command += ["-ac", "1"]
-                elif self.channel_mode == "Force stereo":
-                    command += ["-ac", "2"]
-                command += ["-nostats", "-progress", "pipe:1"]
-                if cover_for_encode:
-                    command += ["-c:v", "mjpeg", "-disposition:v:0", "attached_pic"]
-                command += [str(self.output)]
-
-                total_label = self._format_time(total_duration)
-                self.progress.emit(45, f"Processed audio: 00:00:00 / {total_label}")
-                self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                diagnostics: list[str] = []
-                if self.process.stdout:
-                    for line in self.process.stdout:
-                        diagnostics.append(line.rstrip())
-                        del diagnostics[:-40]
-                        if self.cancel_requested:
-                            self.process.terminate()
-                            break
-                        if line.startswith("out_time_ms=") and total_duration:
-                            elapsed = int(line.split("=", 1)[1]) / 1_000_000
-                            percent = 45 + int(min(50, elapsed / total_duration * 50))
-                            self.progress.emit(percent, f"Processed audio: {self._format_time(elapsed)} / {total_label}")
-                exit_code = self.process.wait()
-                self.process = None
-                if self.cancel_requested:
-                    self.output.unlink(missing_ok=True)
-                    self.cancelled.emit()
-                    return
-                if exit_code != 0:
-                    detail = "\n".join(line for line in diagnostics if line and not line.startswith(("frame=", "out_", "progress=")))
-                    raise RuntimeError(f"FFmpeg failed with exit code {exit_code}.\n\n{detail[-4000:]}")
-                if not self.output.exists() or self.output.stat().st_size == 0:
-                    raise RuntimeError("FFmpeg finished but the output file was empty.")
-                probe = Path(self.ffprobe_path) if self.ffprobe_path else Path(ffmpeg).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
-                if probe.exists():
-                    check = subprocess.run([str(probe), "-v", "error", "-show_entries", "format=duration:format_tags=title", "-show_chapters", "-of", "json", str(self.output)], capture_output=True, text=True)
-                    if check.returncode != 0:
-                        raise RuntimeError(f"Output validation failed:\n{check.stderr[-2000:]}")
-                    report = json.loads(check.stdout)
-                    if len(report.get("chapters", [])) != len(self.chapters):
-                        raise RuntimeError(f"Output validation failed: expected {len(self.chapters)} chapters, found {len(report.get('chapters', []))}.")
-                self.progress.emit(100, "Audiobook ready")
-                self.finished.emit(self.output)
+            output = self.engine.run()
+        except ExportCancelled:
+            self.cancelled.emit()
         except Exception as error:
-            self.output.unlink(missing_ok=True)
             self.failed.emit(str(error))
+        else:
+            self.finished.emit(output)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
-        self.settings = QSettings("AudiobookForge", "AudiobookForge")
+        self.settings = settings if settings is not None else QSettings("AudiobookForge", "AudiobookForge")
         self.chapters: list[Chapter] = []
         self.cover: Path | None = None
         self.thread: QThread | None = None
         self.worker: ConversionWorker | None = None
         self.project_path: Path | None = None
-        self.setWindowTitle("Freedom / Audiobook Forge")
-        self.setMinimumSize(920, 640)
+        self.busy_actions = []
+        self.setWindowTitle("Audiobook Forge")
         self._build_ui()
         self._build_menu()
         self._restore_settings()
 
     def _restore_settings(self) -> None:
-        geometry = self.settings.value("window_geometry")
-        if geometry:
-            self.restoreGeometry(geometry)
-        self.quality_combo.setCurrentIndex(int(self.settings.value("bitrate_index", 1)))
+        # Geometry is intentionally session-local. Remove the legacy value so
+        # older squished layouts cannot be resurrected by a future migration.
+        self.settings.remove("window_geometry")
+        try:
+            bitrate_index = int(self.settings.value("bitrate_index", 1))
+        except (TypeError, ValueError):
+            bitrate_index = 1
+        self.quality_combo.setCurrentIndex(bitrate_index if bitrate_index in range(4) else 1)
         self.channel_combo.setCurrentText(self.settings.value("channel_mode", "Preserve source"))
 
     def _build_menu(self) -> None:
         project_menu = self.menuBar().addMenu("Project")
-        project_menu.addAction("New Project", self.new_project)
-        project_menu.addAction("Open Project...", self.open_project)
-        project_menu.addAction("Save Project", self.save_project)
-        project_menu.addAction("Save Project As...", self.save_project_as)
+        self.busy_actions.extend(
+            [
+                project_menu.addAction("New Project", self.new_project),
+                project_menu.addAction("Open Project...", self.open_project),
+                project_menu.addAction("Save Project", self.save_project),
+                project_menu.addAction("Save Project As...", self.save_project_as),
+            ]
+        )
         tools_menu = self.menuBar().addMenu("Tools")
-        tools_menu.addAction("Choose FFmpeg...", self.choose_ffmpeg)
-        tools_menu.addAction("Choose FFprobe...", self.choose_ffprobe)
+        self.busy_actions.extend(
+            [
+                tools_menu.addAction("Choose FFmpeg...", self.choose_ffmpeg),
+                tools_menu.addAction("Choose FFprobe...", self.choose_ffprobe),
+            ]
+        )
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -295,7 +229,7 @@ class MainWindow(QMainWindow):
         header.addWidget(self.count_label)
         outer.addLayout(header)
 
-        intro = QLabel("Turn a folder of MP3s into one polished, chapterized M4B.")
+        intro = QLabel("Turn a folder of audio tracks into one polished, chapterized M4B.")
         intro.setObjectName("intro")
         outer.addWidget(intro)
 
@@ -303,8 +237,8 @@ class MainWindow(QMainWindow):
         splitter.setChildrenCollapsible(False)
         outer.addWidget(splitter, 1)
 
-        left = QGroupBox("CHAPTERS")
-        left_layout = QVBoxLayout(left)
+        self.chapter_group = QGroupBox("CHAPTERS")
+        left_layout = QVBoxLayout(self.chapter_group)
         self.file_list = DropList()
         self.file_list.paths_dropped.connect(self.add_paths)
         self.file_list.itemChanged.connect(self._chapter_title_changed)
@@ -334,10 +268,10 @@ class MainWindow(QMainWindow):
         row.addStretch()
         row.addWidget(clear_button)
         left_layout.addLayout(row)
-        splitter.addWidget(left)
+        splitter.addWidget(self.chapter_group)
 
-        right = QGroupBox("BOOK DETAILS")
-        details = QGridLayout(right)
+        self.details_group = QGroupBox("BOOK DETAILS")
+        details = QGridLayout(self.details_group)
         details.setVerticalSpacing(12)
         details.addWidget(QLabel("Title"), 0, 0)
         self.title_edit = QLineEdit()
@@ -363,6 +297,7 @@ class MainWindow(QMainWindow):
         details.addWidget(QLabel("Cover image"), 7, 0, Qt.AlignmentFlag.AlignTop)
         cover_row = QVBoxLayout()
         self.cover_drop = CoverDrop()
+        self.cover_drop.path_changed.connect(self._cover_changed)
         cover_row.addWidget(self.cover_drop)
         cover_button = QPushButton("Browse image")
         cover_button.clicked.connect(self.browse_cover)
@@ -388,8 +323,8 @@ class MainWindow(QMainWindow):
         self.channel_combo.addItems(["Preserve source", "Force mono", "Force stereo"])
         details.addWidget(self.channel_combo, 10, 1)
         details.setColumnStretch(1, 1)
-        splitter.addWidget(right)
-        splitter.setSizes([470, 380])
+        splitter.addWidget(self.details_group)
+        splitter.setSizes([620, 400])
 
         footer = QHBoxLayout()
         self.status_label = QLabel("Ready when you are.")
@@ -416,10 +351,18 @@ class MainWindow(QMainWindow):
         outer.addLayout(footer)
 
         self.setStyleSheet(STYLESHEET)
+        # Keep the complete output hint readable and let the details column
+        # establish its usable width from the content rather than the window.
+        output_hint_width = self.output_edit.fontMetrics().horizontalAdvance(
+            self.output_edit.placeholderText()
+        ) + 32
+        self.output_edit.setMinimumWidth(output_hint_width)
 
     def browse_audio(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Choose audio files", self.settings.value("input_directory", ""), "Audio (*.mp3 *.m4a *.aac *.flac *.wav *.ogg)")
-        self.add_paths([Path(path) for path in paths])
+        if paths:
+            self.settings.setValue("input_directory", str(Path(paths[0]).parent))
+            self.add_paths([Path(path) for path in paths])
 
     def browse_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose audiobook folder")
@@ -428,24 +371,38 @@ class MainWindow(QMainWindow):
             self.add_paths([Path(path)])
 
     def add_paths(self, paths: list[Path]) -> None:
+        self._sync_chapters_from_list()
         files = []
         for path in paths:
-            files.extend(supported_audio_files(path) if path.is_dir() else [path])
+            if path.is_dir():
+                files.extend(supported_audio_files(path))
+            elif path.is_file() and path.suffix.casefold() in AUDIO_EXTENSIONS:
+                files.append(path)
         existing = {chapter.path for chapter in self.chapters}
         imported: list[Chapter] = []
         for path in sorted(files, key=natural_sort_key):
-            if path in existing:
+            resolved_path = path.resolve()
+            if resolved_path in existing:
                 continue
             try:
-                chapter = probe_audio(path)
+                chapter = probe_audio(resolved_path)
             except ValueError as error:
                 QMessageBox.warning(self, "Could not read audio", str(error))
                 continue
             self.chapters.append(chapter)
             imported.append(chapter)
-            existing.add(path)
+            existing.add(resolved_path)
+        if self.sort_combo.currentIndex() == 0:
+            self.chapters.sort(key=lambda chapter: natural_sort_key(chapter.path))
+        elif self.sort_combo.currentIndex() == 1:
+            self.chapters.sort(
+                key=lambda chapter: (
+                    chapter.track_number is None,
+                    chapter.track_number or 0,
+                    natural_sort_key(chapter.path),
+                )
+            )
         self._render_chapters()
-        self.sort_combo.setCurrentIndex(0)
         if imported:
             tags = common_tags(imported)
             candidates = {
@@ -486,11 +443,15 @@ class MainWindow(QMainWindow):
         self._refresh_count()
 
     def _renumber_rows(self) -> None:
-        for index in range(self.file_list.count()):
-            item = self.file_list.item(index)
-            duration = float(item.data(Qt.ItemDataRole.UserRole + 1) or 0)
-            title = item.data(Qt.ItemDataRole.UserRole + 2) or item.text()
-            item.setText(f"{index + 1:02d}   {title}   {self._format_time(duration)}")
+        previous = self.file_list.blockSignals(True)
+        try:
+            for index in range(self.file_list.count()):
+                item = self.file_list.item(index)
+                duration = float(item.data(Qt.ItemDataRole.UserRole + 1) or 0)
+                title = item.data(Qt.ItemDataRole.UserRole + 2) or item.text()
+                item.setText(f"{index + 1:02d}   {title}   {self._format_time(duration)}")
+        finally:
+            self.file_list.blockSignals(previous)
 
     def _sync_chapters_from_list(self) -> None:
         chapters_by_path = {chapter.path: chapter for chapter in self.chapters}
@@ -526,20 +487,22 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _format_time(seconds: float) -> str:
-        total_seconds = max(0, int(seconds))
-        return f"{total_seconds // 3600:02d}:{total_seconds % 3600 // 60:02d}:{total_seconds % 60:02d}"
+        return format_time(seconds)
 
     def _refresh_count(self) -> None:
         self.count_label.setText(f"{len(self.chapters)} CHAPTERS")
         total = sum(chapter.duration for chapter in self.chapters)
         bitrate = [64, 96, 128, 160][self.quality_combo.currentIndex()] if hasattr(self, "quality_combo") else 96
-        self.runtime_label.setText(f"Runtime: {self._format_time(total)}  |  Estimated output: ~{total * bitrate * 1000 / 8 / 1_000_000:.0f} MB")
+        estimate = estimate_output_bytes(total, bitrate)
+        self.runtime_label.setText(f"Runtime: {self._format_time(total)}  |  Estimated output: ~{estimate / 1_000_000:.0f} MB")
+
+    def _cover_changed(self, path: Path) -> None:
+        self.cover = path.resolve()
 
     def browse_cover(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Choose cover image", "", "Images (*.jpg *.jpeg *.png *.webp)")
         if path:
-            self.cover = Path(path)
-            self.cover_drop.set_path(self.cover)
+            self.cover_drop.set_path(Path(path).resolve())
 
     def choose_ffmpeg(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Choose ffmpeg executable", "", "FFmpeg executable (ffmpeg.exe)")
@@ -556,6 +519,7 @@ class MainWindow(QMainWindow):
         for edit in self.metadata_edits.values():
             edit.clear()
         self.cover = None
+        self.cover_drop.clear()
         self.output_edit.clear()
         self.project_path = None
 
@@ -568,10 +532,12 @@ class MainWindow(QMainWindow):
     def save_project_as(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Save Audiobook Forge project", "audiobook-project.json", "Audiobook Forge project (*.json)")
         if path:
-            self.project_path = Path(path)
-            self._write_project(self.project_path)
+            project_path = Path(path)
+            if self._write_project(project_path):
+                self.project_path = project_path
 
-    def _write_project(self, path: Path) -> None:
+    def _write_project(self, path: Path) -> bool:
+        self._sync_chapters_from_list()
         metadata = BookMetadata(
             title=self.title_edit.text().strip(),
             author=self.author_edit.text().strip(),
@@ -582,30 +548,87 @@ class MainWindow(QMainWindow):
             genre=self.metadata_edits["genre"].text().strip(),
         )
         bitrate = [64, 96, 128, 160][self.quality_combo.currentIndex()]
-        save_project(path, self.chapters, metadata, self.cover, Path(self.output_edit.text()) if self.output_edit.text() else None, bitrate, self.channel_combo.currentText())
+        try:
+            save_project(
+                path,
+                self.chapters,
+                metadata,
+                self.cover,
+                Path(self.output_edit.text()) if self.output_edit.text() else None,
+                bitrate,
+                self.channel_combo.currentText(),
+            )
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "Could not save project", str(error))
+            return False
+        self.status_label.setText(f"Saved project {path.name}")
+        return True
 
     def open_project(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Open Audiobook Forge project", "", "Audiobook Forge project (*.json)")
         if not path:
             return
         try:
-            payload = load_project(Path(path))
-            self.chapters = [Chapter(Path(item["path"]), item["title"], float(item["duration"]), item.get("track_number")) for item in payload["chapters"]]
-            self._render_chapters()
+            project_path = Path(path)
+            payload = load_project(project_path)
             saved_metadata = payload.get("metadata", {})
+
+            def project_file(saved_path: str) -> Path:
+                candidate = Path(saved_path).expanduser()
+                if not candidate.is_absolute():
+                    candidate = project_path.parent / candidate
+                return candidate.resolve()
+
+            loaded_chapters = [
+                Chapter(
+                    project_file(item["path"]),
+                    item["title"],
+                    float(item["duration"]),
+                    item.get("track_number"),
+                    item.get("channels"),
+                    item.get("sample_rate"),
+                )
+                for item in payload["chapters"]
+            ]
+            loaded_cover = project_file(payload["cover"]) if payload.get("cover") else None
+            loaded_output = str(project_file(payload["output"])) if payload.get("output") else ""
+            loaded_bitrate = {64: 0, 96: 1, 128: 2, 160: 3}.get(
+                payload.get("bitrate", 96), 1
+            )
+            loaded_channel_mode = payload.get("channel_mode", "Preserve source")
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            QMessageBox.critical(self, "Could not open project", str(error))
+            return
+
+        self.chapters = loaded_chapters
+        self._render_chapters()
+        try:
             self.title_edit.setText(saved_metadata.get("title", ""))
             self.author_edit.setText(saved_metadata.get("author", ""))
             for key, metadata_key in {"composer": "narrator", "grouping": "series", "series_number": "series_number", "date": "year", "genre": "genre"}.items():
                 self.metadata_edits[key].setText(saved_metadata.get(metadata_key, ""))
-            self.cover = Path(payload["cover"]) if payload.get("cover") else None
-            if self.cover and self.cover.exists():
-                self.cover_drop.set_path(self.cover)
-            self.output_edit.setText(payload.get("output", ""))
-            self.quality_combo.setCurrentIndex({64: 0, 96: 1, 128: 2, 160: 3}.get(payload.get("bitrate", 96), 1))
-            self.channel_combo.setCurrentText(payload.get("channel_mode", "Preserve source"))
-            self.project_path = Path(path)
-        except (OSError, KeyError, TypeError, ValueError) as error:
+        except (AttributeError, TypeError) as error:
             QMessageBox.critical(self, "Could not open project", str(error))
+            return
+        self.cover = loaded_cover
+        if self.cover and self.cover.is_file():
+            self.cover_drop.set_path(self.cover)
+        else:
+            self.cover_drop.clear()
+        self.output_edit.setText(loaded_output)
+        self.quality_combo.setCurrentIndex(loaded_bitrate)
+        self.channel_combo.setCurrentText(loaded_channel_mode)
+        self.project_path = Path(path)
+        missing = [chapter.path for chapter in self.chapters if not chapter.path.is_file()]
+        if missing:
+            preview = "\n".join(str(item) for item in missing[:5])
+            suffix = f"\n…and {len(missing) - 5} more" if len(missing) > 5 else ""
+            QMessageBox.warning(
+                self,
+                "Missing source files",
+                "This project references audio files that could not be found:\n"
+                f"{preview}{suffix}\n\nRelocate or re-add them before exporting.",
+            )
 
     def browse_output(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Export audiobook", self.settings.value("output_directory", "audiobook.m4b"), "M4B audiobook (*.m4b)")
@@ -616,35 +639,86 @@ class MainWindow(QMainWindow):
     def convert(self) -> None:
         self._sync_chapters_from_list()
         if not self.chapters:
-            QMessageBox.warning(self, "No chapters", "Drop at least one MP3 file before exporting.")
+            QMessageBox.warning(self, "No chapters", "Drop at least one audio file before exporting.")
             return
         if not self.title_edit.text().strip() or not self.author_edit.text().strip():
             QMessageBox.warning(self, "Missing details", "Add a title and author before exporting.")
             return
-        output = Path(self.output_edit.text().strip()) if self.output_edit.text().strip() else self.chapters[0].path.with_name(f"{self.title_edit.text().strip()}.m4b")
+        missing = [chapter.path for chapter in self.chapters if not chapter.path.is_file()]
+        if missing:
+            QMessageBox.warning(
+                self,
+                "Missing source files",
+                "One or more source audio files could not be found. "
+                "Re-add them or open a corrected project before exporting.",
+            )
+            return
+        if self.cover and not self.cover.is_file():
+            QMessageBox.warning(
+                self,
+                "Missing cover image",
+                "The selected cover image could not be found. Choose it again or start a new project.",
+            )
+            return
+        output = (
+            Path(self.output_edit.text().strip()).expanduser()
+            if self.output_edit.text().strip()
+            else self.chapters[0].path.with_name(
+                f"{safe_output_stem(self.title_edit.text())}.m4b"
+            )
+        )
+        if not output.suffix:
+            output = output.with_suffix(".m4b")
+        elif output.suffix.casefold() != ".m4b":
+            QMessageBox.warning(
+                self,
+                "Invalid output type",
+                "Audiobook Forge exports .m4b files. Choose a filename ending in .m4b.",
+            )
+            return
+        if not output.parent.exists():
+            QMessageBox.warning(
+                self,
+                "Missing output folder",
+                f"The output folder does not exist:\n{output.parent}",
+            )
+            return
+        output = output.resolve()
         if output.exists():
             choice = QMessageBox.question(self, "Output already exists", f"Replace this file?\n{output}", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if choice != QMessageBox.StandardButton.Yes:
                 return
         bitrate = [64, 96, 128, 160][self.quality_combo.currentIndex()]
-        estimate = int(sum(chapter.duration for chapter in self.chapters) * bitrate * 1000 / 8)
+        estimate = estimate_output_bytes(sum(chapter.duration for chapter in self.chapters), bitrate)
+        workspace_estimate = int(estimate * 2.2)
         try:
             free_space = shutil.disk_usage(output.parent.resolve()).free
         except OSError:
-            free_space = estimate * 2
-        if free_space < estimate * 1.5:
-            choice = QMessageBox.warning(self, "Low disk space", f"The destination may not have enough free space for this export.\nEstimated output: {estimate / 1_000_000:.0f} MB", QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+            free_space = workspace_estimate
+        if free_space < workspace_estimate:
+            choice = QMessageBox.warning(self, "Low disk space", f"The destination may not have enough free space for the output and temporary encoding files.\nEstimated output: {estimate / 1_000_000:.0f} MB", QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
             if choice != QMessageBox.StandardButton.Ok:
                 return
         self.output_edit.setText(str(output))
-        self.convert_button.setEnabled(False)
-        self.cancel_button.setEnabled(True)
+        self._set_exporting(True)
         self.progress.setValue(0)
-        self.thread = QThread(self)
+        chapters = [
+            Chapter(
+                chapter.path,
+                chapter.title,
+                chapter.duration,
+                chapter.track_number,
+                chapter.channels,
+                chapter.sample_rate,
+            )
+            for chapter in self.chapters
+        ]
+        thread = QThread(self)
         metadata = {key: edit.text().strip() for key, edit in self.metadata_edits.items()}
         metadata["album"] = metadata.get("title", "")
-        self.worker = ConversionWorker(
-            self.chapters,
+        metadata["album_artist"] = metadata.get("artist", "")
+        worker = ConversionWorker(
+            chapters,
             output,
             metadata,
             self.cover,
@@ -653,19 +727,33 @@ class MainWindow(QMainWindow):
             self.settings.value("ffmpeg_path", "") or None,
             self.settings.value("ffprobe_path", "") or None,
         )
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.progress.connect(lambda value, message: (self.progress.setValue(value), self.status_label.setText(message)))
-        self.worker.finished.connect(self.conversion_finished)
-        self.worker.failed.connect(self.conversion_failed)
-        self.worker.cancelled.connect(self.conversion_cancelled)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.worker.cancelled.connect(self.thread.quit)
-        self.thread.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self._conversion_thread_finished)
-        self.thread.finished.connect(self.thread.deleteLater)
-        self.thread.start()
+        self.thread = thread
+        self.worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self.update_progress)
+        worker.finished.connect(self.conversion_finished)
+        worker.failed.connect(self.conversion_failed)
+        worker.cancelled.connect(self.conversion_cancelled)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._conversion_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def update_progress(self, value: int, message: str) -> None:
+        self.progress.setValue(value)
+        self.status_label.setText(message)
+
+    def _set_exporting(self, exporting: bool) -> None:
+        self.chapter_group.setEnabled(not exporting)
+        self.details_group.setEnabled(not exporting)
+        for action in self.busy_actions:
+            action.setEnabled(not exporting)
+        self.convert_button.setEnabled(not exporting)
+        self.cancel_button.setEnabled(exporting)
 
     def cancel_conversion(self) -> None:
         if self.worker:
@@ -676,31 +764,27 @@ class MainWindow(QMainWindow):
     def _conversion_thread_finished(self) -> None:
         self.worker = None
         self.thread = None
-        self.cancel_button.setEnabled(False)
+        self._set_exporting(False)
 
     def closeEvent(self, event) -> None:
         if self.thread and self.thread.isRunning():
             QMessageBox.warning(self, "Export in progress", "Wait for the audiobook export to finish before closing.")
             event.ignore()
             return
-        self.settings.setValue("window_geometry", self.saveGeometry())
         self.settings.setValue("bitrate_index", self.quality_combo.currentIndex())
         self.settings.setValue("channel_mode", self.channel_combo.currentText())
         event.accept()
 
     def conversion_finished(self, output: Path) -> None:
-        self.convert_button.setEnabled(True)
         self.status_label.setText(f"Saved to {output.name}")
         QMessageBox.information(self, "Audiobook ready", f"Created:\n{output}")
 
     def conversion_failed(self, message: str) -> None:
-        self.convert_button.setEnabled(True)
         self.progress.setValue(0)
         self.status_label.setText("Export failed")
         QMessageBox.critical(self, "Could not export", message)
 
     def conversion_cancelled(self) -> None:
-        self.convert_button.setEnabled(True)
         self.progress.setValue(0)
         self.status_label.setText("Export cancelled")
 

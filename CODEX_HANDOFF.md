@@ -21,65 +21,47 @@ The user wants Codex to refine the application into a robust, polished audiobook
 - Local path: `D:\VS Code\MP3 to M4b`
 - Branch: `main`
 - Remote: `https://github.com/StevenM1080/Audiobook-Forge.git`
-- Current commit: `c1457e5 Fix metadata escaping test`
-- Local branch and `origin/main` were synchronized to that commit.
-- Working tree was clean after the rollback.
+- Baseline commit before the current repair work: `3d4db0e Add Codex implementation handoff`.
+- The `main.pyw` content at that baseline is identical to `c1457e5` and already uses the helper modules.
+- Check `git status` before editing because the working tree may contain active repair work.
 - Primary entry point: `main.pyw`
-- Python target: Windows, currently developed with Python 3.11 in `.venv`; a Python 3.14 interpreter was also detected in VS Code.
+- Python target: Windows. The current `.venv` uses Python 3.14.
 
-The user explicitly requested a rollback to commit `c1457e5`. Do not restore later commits automatically without confirming with the user.
+The user rejected the later small, squished layout experiment. Do not restore those layout changes automatically.
 
-## Important Current-State Inconsistency
+## Current Application Baseline
 
-At `c1457e5`, `main.pyw` is the older implementation. It imports `mutagen.mp3.MP3`, accepts only `.mp3`, and does not use the newer helper modules.
+The active `main.pyw` uses the `audiobook_forge` helper modules and supports the broader authoring workflow described by the README. The previous claim that `c1457e5` contained an MP3-only entry point was incorrect.
 
-The repository still contains helper modules and tests from the later experimental upgrade:
+The active modules are:
 
 - `audiobook_forge/models.py`
 - `audiobook_forge/media.py`
 - `audiobook_forge/cover.py`
+- `audiobook_forge/exporter.py`
 - `audiobook_forge/project_io.py`
 - `tests/test_core.py`
+- `tests/test_exporter.py`
 - `tests/test_project_io.py`
+- `tests/test_ui.py`
 
-The current `README.md` describes features from the later upgrade that are not all present in the active `main.pyw`. Codex should first choose and document a coherent baseline, then reconcile or remove stale pieces carefully. Do not assume the README is proof that a feature is active.
-
-## Active Older Application Behavior
-
-The active older `main.pyw` currently contains:
+The application currently contains:
 
 - Dark Fusion/PySide6 GUI.
-- Two-column layout.
-- `QListWidget` chapter list.
-- MP3 file drag/drop and file browsing.
-- Manual row movement through `QListWidget.InternalMove`.
-- Title and author line edits.
+- Roomy, resizable two-column layout.
+- Explicit `Chapter` model synchronized with the chapter list.
+- File and non-recursive folder import for MP3, M4A, AAC, FLAC, WAV, and OGG.
+- Natural, embedded-track, and manual ordering.
+- Editable chapter titles, removal, duration display, and output estimates.
+- Extended book metadata.
 - Cover drag/drop and browse field with preview.
-- Output file browse field.
 - A threaded `ConversionWorker` using `QThread`.
-- Mutagen MP3 duration probing.
-- Temporary concat and FFmetadata files.
-- FFmpeg AAC encoding at hard-coded 96 kbps.
-- Chapter titles derived from source filenames.
+- Mixed-format normalization before final assembly.
+- Temporary staged output followed by validated atomic replacement.
+- Cover normalization and FFmpeg/FFprobe discovery.
+- Encoding presets, channel handling, cancellation, and diagnostics.
+- Versioned JSON project save/load.
 - FFmpeg progress displayed as processed audio time.
-- Basic failure dialog.
-
-Known weaknesses in this active version include:
-
-- Only `.mp3` is supported.
-- No folder import.
-- No natural sorting.
-- The list is the effective state store; chapter titles are not modeled separately.
-- No Remove Selected action.
-- Row numbering can become stale after manual reorder.
-- No expanded metadata beyond title and author.
-- No robust FFmpeg/FFprobe discovery configuration.
-- No cancellation in the older baseline.
-- No project save/load in the active entry point.
-- No output validation in the active entry point.
-- Cover art is embedded as selected, without guaranteed normalization.
-- The worker has minimal diagnostics and hard-coded encoding settings.
-- The active code may not match the later README wording.
 
 ## Helper Modules Present
 
@@ -137,16 +119,10 @@ These commits were created during the earlier implementation attempt. The branch
   - Experimented with QSettings, JSON projects, cover normalization, metadata autofill, and FFprobe chapter validation.
 - `daacac6 Add sorting and export safeguards`
   - Experimented with manual/natural/track sorting, disk-space warnings, and explicit FFprobe selection.
-- `ba99e72 Prevent book details layout clipping`
-  - Added a scrollable details pane to address vertical clipping.
-- `8df3010 Stabilize startup window and cover layout`
-  - Attempted to stabilize opening dimensions and cover expansion.
-- `d62f588 Fix details form vertical sizing`
-  - Added explicit details-form sizing.
-- `7dbd8e6 Match fixed compact window layout`
-  - Removed scrolling, fixed the window to `760 x 700`, compacted the form, and made the cover area expand locally.
+- Several later layout commits experimented with scrolling and compressed geometry.
+  - Those experiments produced the rejected small, squished result and should not be reapplied.
 - `c1457e5 Fix metadata escaping test`
-  - Corrected the metadata escaping test. This is the requested rollback target and current branch tip.
+  - Corrected the metadata escaping test and retained the roomier application layout.
 
 ## User Interface Feedback History
 
@@ -156,13 +132,11 @@ The user provided screenshots and feedback that should guide future refinement:
 2. Long exports displayed values such as `504:11`; this was clarified as processed audio timestamp, not wall-clock time.
 3. Progress wording was changed to the clearer format:
    - `Processed audio: 08:24:11 / 11:47:12`
-4. The details form repeatedly became clipped or overlapped when the window was resized.
-5. The user did not want scrolling and did not want the form squished.
-6. The desired layout was a compact fixed composition matching the provided screenshot.
-7. The later layout experiment used a fixed `760 x 700` window, no scroll area, compact vertical spacing, and a cover area that expanded locally from approximately 150 px to 190 px.
-8. That later layout was subsequently rolled back when the user requested `c1457e5`.
+4. The desired reference is the first user-provided screenshot: a roomy, readable, resizable two-column window.
+5. The second screenshot is explicitly rejected because the details form and cover controls are compressed and overlap.
+6. There is no required fixed pixel size. Preserve proportions and prevent controls from overlapping as the window is resized.
 
-Codex should use actual rendered screenshots and geometry checks when refining the UI. Avoid relying only on `sizeHint()` for nested layouts.
+Codex should use actual rendered screenshots and geometry checks when refining the UI. Avoid relying only on `sizeHint()` for nested layouts, and do not introduce a fixed compact window size.
 
 ## Dependencies
 
@@ -207,13 +181,36 @@ $env:QT_QPA_PLATFORM = 'offscreen'
 
 The Qt environment may print a non-fatal font-directory warning from PySide6 in headless mode.
 
-The last known test result before rollback was:
+The current repair suite result is:
 
 ```text
-4 passed in 0.10s
+37 passed
 ```
 
-Those tests cover natural sorting, metadata escaping, output estimation, and project JSON round-tripping. They do not cover full GUI behavior or a complete encode.
+The suite includes a short generated mixed-format end-to-end encode as well as focused exporter, project, ordering, drag/drop, cover-state, metadata, and model tests.
+
+## Current Repair Status
+
+Implemented in the current working tree:
+
+- Normalize every source chapter to a consistent AAC stream before concatenation.
+- Assemble and validate the M4B in a temporary directory on the destination volume.
+- Atomically replace the requested destination only after successful validation.
+- Preserve an existing destination after preflight, encoding, validation, or cancellation failure.
+- Validate duration, chapter count/boundaries/titles, audio presence, and cover art using FFprobe when available and Mutagen as the local fallback; the end-to-end test also verifies core metadata tags.
+- Discover bundled, configured, PATH, sibling, and `.spotdl` FFmpeg/FFprobe tools.
+- Fix cover drag/drop state, internal chapter drag acceptance, full-list sorting, manual-order preservation, source snapshots during export, and export-time control locking.
+- Validate projects, save them atomically, resolve legacy relative paths, report missing sources, and clear stale cover previews.
+- Remove the hard-coded undersized window minimum and rely on content-derived minimum geometry.
+- Do not restore or save window geometry; only bitrate and channel preferences persist so a previously squished session cannot dictate the next layout.
+- Keep the output placeholder readable and initialize the splitter with a roomy chapter/details balance so the details controls do not collapse into a narrow column.
+
+Useful remaining refinements:
+
+- Move large-folder probing and metadata reads off the GUI thread.
+- Replace decorated `QListWidget` editing with a dedicated model/delegate.
+- Add unsaved-project tracking, moved-file relinking, and recent projects.
+- Add an in-app tool/version status report, packaging, and Windows CI.
 
 ## Recommended Codex Work Plan
 
@@ -261,9 +258,9 @@ Use a model/view widget or carefully synchronize a custom list view. Do not use 
 - Preserve manual order after a drag.
 - Renumber display rows after every mutation.
 
-### 5. Make the fixed UI deliberate
+### 5. Preserve the roomy, resizable UI
 
-The user prefers no scrolling and no squished content. Choose a defined fixed/default size based on a rendered reference screenshot. Use compact but readable controls, explicit minimum/maximum sizes, and geometry tests or screenshots. If all metadata cannot fit at the chosen dimensions, simplify the presentation rather than allowing overlap.
+Use the first user-provided screenshot as the visual reference. Keep the two-column composition spacious and resizable, prevent overlap at the minimum usable dimensions, and do not impose the rejected compact fixed-size layout.
 
 ### 6. Improve conversion reliability
 
@@ -312,6 +309,6 @@ Avoid requiring a long real audiobook encode in every test. Use short generated 
 - Commit major changes with clear messages if requested by the user.
 - Run focused validation immediately after each substantive edit.
 
-## Suggested First Codex Prompt
+## Suggested Continuation Prompt
 
-> Inspect the current repository at commit `c1457e5`. Reconcile the active older `main.pyw` with the stale helper modules and README. Preserve the original MP3-to-chapterized-M4B workflow, then implement Phase 1 only: explicit chapter model, generalized probing, folder/file import, natural sorting, editable titles, remove selected, correct renumbering, and duration display. Keep the UI fixed and non-scrolling at the user-approved screenshot dimensions. Add focused tests, run them, and report any unresolved UI geometry issues before proceeding.
+> Continue refining the current Audiobook Forge working tree. Preserve the roomy, resizable two-column layout shown in the preferred screenshot. Run the focused tests and short generated-media export test after changes, and never modify source audio or replace an existing destination until a staged export has passed validation.

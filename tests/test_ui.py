@@ -1,0 +1,181 @@
+from __future__ import annotations
+
+import importlib.util
+import os
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+from PySide6.QtCore import QPoint, QSettings, Qt
+from PySide6.QtGui import QDragEnterEvent
+from PySide6.QtWidgets import QApplication, QListWidgetItem, QMainWindow
+
+from audiobook_forge.models import Chapter
+
+
+def _load_main():
+    spec = importlib.util.spec_from_file_location(
+        "audiobook_forge_main_ui", Path(__file__).parents[1] / "main.pyw"
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def app() -> QApplication:
+    return QApplication.instance() or QApplication([])
+
+
+def _window(module, tmp_path: Path):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    return module.MainWindow(settings)
+
+
+def test_internal_chapter_drag_is_accepted(app: QApplication) -> None:
+    module = _load_main()
+    widget = module.DropList()
+    item = QListWidgetItem("Chapter")
+    widget.addItem(item)
+    mime = widget.mimeData([item])
+    event = QDragEnterEvent(
+        QPoint(5, 5),
+        Qt.DropAction.MoveAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+
+    widget.dragEnterEvent(event)
+
+    assert event.isAccepted()
+
+
+def test_cover_drop_updates_export_state_and_new_project_clears_it(
+    app: QApplication, tmp_path: Path
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    cover = tmp_path / "cover.jpg"
+    cover.write_bytes(b"not-an-image")
+
+    window.cover_drop.set_path(cover)
+    assert window.cover == cover.resolve()
+
+    window.new_project()
+    assert window.cover is None
+    assert window.cover_drop.path is None
+
+
+def test_layout_uses_content_minimums_instead_of_a_fixed_window_size(
+    app: QApplication, tmp_path: Path
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    assert window.minimumWidth() == 0
+    assert window.minimumHeight() == 0
+
+    window.resize(920, 640)
+    window.show()
+    app.processEvents()
+
+    assert window.output_edit.minimumWidth() >= 180
+    assert window.details_group.width() >= 390
+    assert window.output_edit.width() >= window.output_edit.minimumWidth()
+    assert window.details_group.height() >= window.details_group.minimumSizeHint().height()
+    assert window.chapter_group.width() >= window.chapter_group.minimumSizeHint().width()
+    window.close()
+
+
+def test_window_geometry_preference_is_ignored(
+    app: QApplication, tmp_path: Path
+) -> None:
+    module = _load_main()
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    saved_window = QMainWindow()
+    saved_window.resize(120, 120)
+    settings.setValue("window_geometry", saved_window.saveGeometry())
+
+    window = module.MainWindow(settings)
+
+    assert not settings.contains("window_geometry")
+    assert window.width() > 120 or window.height() > 120
+    window.close()
+
+
+def test_manual_order_survives_an_addition(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    first = tmp_path / "02.mp3"
+    second = tmp_path / "01.mp3"
+    added = tmp_path / "03.mp3"
+    for path in (first, second, added):
+        path.write_bytes(b"audio")
+    window.chapters = [
+        Chapter(first.resolve(), "Second", 1.0),
+        Chapter(second.resolve(), "First", 1.0),
+    ]
+    window._render_chapters()
+    window.sort_combo.setCurrentIndex(2)
+    monkeypatch.setattr(
+        module,
+        "probe_audio",
+        lambda path: Chapter(path.resolve(), path.stem, 1.0),
+    )
+    monkeypatch.setattr(module, "common_tags", lambda _chapters: {})
+
+    window.add_paths([added])
+
+    assert [chapter.path for chapter in window.chapters] == [
+        first.resolve(),
+        second.resolve(),
+        added.resolve(),
+    ]
+    assert window.sort_combo.currentIndex() == 2
+
+
+def test_natural_sort_reorders_the_complete_chapter_list(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    chapter_two = tmp_path / "Chapter 2.mp3"
+    chapter_one = tmp_path / "Chapter 1.mp3"
+    chapter_two.write_bytes(b"audio")
+    chapter_one.write_bytes(b"audio")
+    window.chapters = [Chapter(chapter_two.resolve(), "Two", 1.0)]
+    window._render_chapters()
+    monkeypatch.setattr(
+        module,
+        "probe_audio",
+        lambda path: Chapter(path.resolve(), path.stem, 1.0),
+    )
+    monkeypatch.setattr(module, "common_tags", lambda _chapters: {})
+
+    window.add_paths([chapter_one])
+
+    assert [chapter.path for chapter in window.chapters] == [
+        chapter_one.resolve(),
+        chapter_two.resolve(),
+    ]
+
+
+def test_track_number_sort_places_untagged_chapters_last(
+    app: QApplication, tmp_path: Path
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    window.chapters = [
+        Chapter(Path("untagged.mp3"), "Untagged", 1.0),
+        Chapter(Path("track-2.mp3"), "Two", 1.0, track_number=2),
+        Chapter(Path("track-1.mp3"), "One", 1.0, track_number=1),
+    ]
+    window._render_chapters()
+
+    window.sort_combo.setCurrentIndex(1)
+
+    assert [chapter.track_number for chapter in window.chapters] == [1, 2, None]

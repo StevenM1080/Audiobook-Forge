@@ -16,7 +16,16 @@ def probe_audio(path: Path) -> Chapter:
         tags = audio.tags or {}
         title = _first_tag(tags, "title") or path.stem
         track_number = _track_number(_first_tag(tags, "tracknumber"))
-        return Chapter(path=path, title=title, duration=float(audio.info.length), track_number=track_number)
+        channels = _positive_int(getattr(audio.info, "channels", None))
+        sample_rate = _positive_int(getattr(audio.info, "sample_rate", None))
+        return Chapter(
+            path=path.resolve(),
+            title=title,
+            duration=float(audio.info.length),
+            track_number=track_number,
+            channels=channels,
+            sample_rate=sample_rate,
+        )
     except Exception as error:
         raise ValueError(f"Could not read {path}: {error}") from error
 
@@ -24,7 +33,10 @@ def probe_audio(path: Path) -> Chapter:
 def common_tags(chapters: list[Chapter]) -> dict[str, str]:
     values: dict[str, list[str]] = {}
     for chapter in chapters:
-        audio = File(chapter.path, easy=True)
+        try:
+            audio = File(chapter.path, easy=True)
+        except Exception:
+            return {}
         for key in ("album", "albumartist", "artist", "composer", "date", "genre"):
             value = _first_tag(audio.tags if audio else None, key)
             if value:
@@ -46,3 +58,11 @@ def _first_tag(tags: object, key: str) -> str:
 def _track_number(value: str) -> int | None:
     match = re.match(r"\s*(\d+)", value)
     return int(match.group(1)) if match else None
+
+
+def _positive_int(value: object) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
