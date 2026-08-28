@@ -20,11 +20,13 @@ A PySide6 desktop app for authoring a chapterized M4B audiobook from MP3, M4A, A
 
 Python 3.10 or newer is required.
 
-Drop audio files or a complete audiobook folder into the chapter list. Use the sort control, drag rows for manual order, double-click chapter titles to edit them, enter book metadata, choose quality/channel settings, and export. Projects can be saved as JSON from the **Project** menu.
+Drop audiobook folders or groups of audio files into the book tree. Each folder is one book, and files selected in one action form one book. Expand or collapse books, drag chapters within a book for manual order, double-click chapter titles to edit them, select books to edit their metadata, choose per-book quality/channel settings, choose one batch destination folder, and export all books. Projects can be saved as JSON from the **Project** menu.
+
+Batch output is organized as `Destination\Author\[Series]\[Series Number - ]Title\Title.m4b`. Existing author and series folders are reused. Books are exported sequentially and committed after validation; cancelling or failing a later book preserves all earlier completed books and stops the remaining queue.
 
 Each source chapter is normalized to a compatible temporary audio stream before the final M4B is assembled. The completed audiobook is validated in a staging directory and only then replaces the selected destination, so cancellation or conversion failure does not delete an existing audiobook.
 
-Project files reference the original audio and cover files by absolute path; they do not embed source media. Keep those files available or re-add moved tracks before exporting.
+Project files reference the original audio and cover files by absolute path; they do not embed source media. Keep those files available or re-add moved tracks before exporting. New projects use the version 2 multi-book format; version 1 single-book projects are migrated when opened.
 
 ## Test
 

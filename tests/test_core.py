@@ -1,7 +1,13 @@
 from pathlib import Path
 
 from audiobook_forge.exporter import metadata_value
-from audiobook_forge.models import estimate_output_bytes, natural_sort_key, safe_output_stem
+from audiobook_forge.models import (
+    BookMetadata,
+    book_output_path,
+    estimate_output_bytes,
+    natural_sort_key,
+    safe_output_stem,
+)
 
 
 def test_natural_sort_key_orders_numbers_numerically() -> None:
@@ -26,3 +32,19 @@ def test_output_estimate() -> None:
 def test_safe_output_stem_removes_windows_filename_characters() -> None:
     assert safe_output_stem('Book: Part 1 / "Final"') == "Book- Part 1 - -Final-"
     assert safe_output_stem("CON") == "CON-audiobook"
+
+
+def test_book_output_path_reuses_author_and_series_folders(tmp_path: Path) -> None:
+    metadata = BookMetadata(title="The First Book", author="An Author", series="A Series", series_number="1")
+
+    output = book_output_path(tmp_path, metadata)
+
+    assert output == tmp_path / "An Author" / "A Series" / "01 - The First Book" / "The First Book.m4b"
+
+
+def test_book_output_path_sanitizes_folder_components(tmp_path: Path) -> None:
+    metadata = BookMetadata(title="Book", author="Author: Name", series_number="2")
+
+    output = book_output_path(tmp_path, metadata)
+
+    assert output.parent == tmp_path / "Author- Name" / "02 - Book"

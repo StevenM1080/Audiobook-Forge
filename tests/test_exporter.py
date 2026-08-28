@@ -9,6 +9,7 @@ import pytest
 
 from audiobook_forge import exporter
 from audiobook_forge.exporter import (
+    BatchExportEngine,
     ExportCancelled,
     ExportEngine,
     build_mux_command,
@@ -20,7 +21,7 @@ from audiobook_forge.exporter import (
     write_metadata_file,
 )
 from audiobook_forge.media import probe_audio
-from audiobook_forge.models import Chapter
+from audiobook_forge.models import Book, BookMetadata, Chapter
 from mutagen.mp4 import MP4
 
 
@@ -382,3 +383,90 @@ def test_mixed_format_export_keeps_all_audio(tmp_path: Path) -> None:
     assert mp4.tags.get("\xa9ART") == ["Author"]
     assert mp4.tags.get("aART") == ["Author"]
     assert mp4.tags.get("\xa9alb") == ["Book"]
+
+
+def test_batch_export_commits_each_book_before_the_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "output"
+    destination.mkdir()
+    first = Book(
+        chapters=[Chapter(tmp_path / "one.mp3", "One", 1.0)],
+        metadata=BookMetadata(title="First", author="Author"),
+    )
+    second = Book(
+        chapters=[Chapter(tmp_path / "two.mp3", "Two", 1.0)],
+        metadata=BookMetadata(title="Second", author="Author"),
+    )
+    seen_before_second: list[bool] = []
+
+    class FakeEngine:
+        calls = 0
+
+        def __init__(self, chapters, output, *_args, **_kwargs) -> None:
+            self.output = output
+            self.chapters = chapters
+
+        def run(self) -> Path:
+            FakeEngine.calls += 1
+            if FakeEngine.calls == 2:
+                seen_before_second.append((destination / "Author" / "First" / "First.m4b").is_file())
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_bytes(b"completed")
+            return self.output
+
+        def cancel(self) -> None:
+            pass
+
+    monkeypatch.setattr(exporter, "ExportEngine", FakeEngine)
+
+    outputs = BatchExportEngine([first, second], destination, None, None).run()
+
+    assert seen_before_second == [True]
+    assert outputs == [
+        destination / "Author" / "First" / "First.m4b",
+        destination / "Author" / "Second" / "Second.m4b",
+    ]
+
+
+@pytest.mark.parametrize("exception", [ExportCancelled, RuntimeError])
+def test_batch_export_stops_after_current_book_and_preserves_completed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exception: type[Exception]
+) -> None:
+    destination = tmp_path / "output"
+    destination.mkdir()
+    books = [
+        Book(
+            chapters=[Chapter(tmp_path / f"{index}.mp3", str(index), 1.0)],
+            metadata=BookMetadata(title=f"Book {index}", author="Author"),
+        )
+        for index in range(1, 4)
+    ]
+
+    class FakeEngine:
+        calls = 0
+
+        def __init__(self, chapters, output, *_args, **_kwargs) -> None:
+            self.output = output
+
+        def run(self) -> Path:
+            FakeEngine.calls += 1
+            if FakeEngine.calls == 2:
+                raise exception("stopped") if exception is RuntimeError else exception()
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_bytes(b"completed")
+            return self.output
+
+        def cancel(self) -> None:
+            pass
+
+    monkeypatch.setattr(exporter, "ExportEngine", FakeEngine)
+    engine = BatchExportEngine(books, destination, None, None)
+
+    with pytest.raises(exception):
+        engine.run()
+
+    assert engine.completed == [destination / "Author" / "Book 1" / "Book 1.m4b"]
+    assert engine.completed[0].is_file()
+    assert not (destination / "Author" / "Book 2").exists()
+    assert not (destination / "Author" / "Book 3" / "Book 3.m4b").exists()

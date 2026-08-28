@@ -13,10 +13,11 @@ from pathlib import Path
 from mutagen import File
 
 from .cover import normalize_cover
-from .models import Chapter
+from .models import Book, BookMetadata, Chapter, book_output_path
 
 
 ProgressCallback = Callable[[int, str], None]
+BookFinishedCallback = Callable[[int, Book, Path], None]
 
 
 class ExportCancelled(Exception):
@@ -32,6 +33,23 @@ def metadata_value(value: str) -> str:
         .replace("#", "\\#")
         .replace("\n", "\\n")
     )
+
+
+def metadata_for_book(metadata: BookMetadata) -> dict[str, str]:
+    """Map application metadata to the common FFmpeg/MP4 tag names."""
+
+    values = {
+        "title": metadata.title.strip(),
+        "artist": metadata.author.strip(),
+        "album_artist": metadata.author.strip(),
+        "album": metadata.title.strip(),
+        "composer": metadata.narrator.strip(),
+        "grouping": metadata.series.strip(),
+        "series_number": metadata.series_number.strip(),
+        "date": metadata.year.strip(),
+        "genre": metadata.genre.strip(),
+    }
+    return {key: value for key, value in values.items() if value}
 
 
 def concat_path(path: Path) -> str:
@@ -401,7 +419,7 @@ class ExportEngine:
             sibling_directories=(ffmpeg.parent,),
         )
 
-        self.output.parent.mkdir(parents=False, exist_ok=True)
+        self.output.parent.mkdir(parents=True, exist_ok=True)
         total_source_duration = sum(chapter.duration for chapter in self.chapters)
         total_label = format_time(total_source_duration)
         channels = target_channel_count(self.chapters, self.channel_mode)
@@ -584,3 +602,100 @@ class ExportEngine:
         if duration <= 0:
             raise RuntimeError(f"Encoded chapter {path.name} has no readable duration.")
         return duration
+
+
+class BatchExportEngine:
+    """Export books one at a time, committing each validated output immediately."""
+
+    def __init__(
+        self,
+        books: Sequence[Book],
+        destination_root: Path,
+        ffmpeg_path: str | None,
+        ffprobe_path: str | None,
+        progress: ProgressCallback | None = None,
+        book_finished: BookFinishedCallback | None = None,
+    ) -> None:
+        self.books = tuple(books)
+        self.destination_root = destination_root
+        self.ffmpeg_path = ffmpeg_path
+        self.ffprobe_path = ffprobe_path
+        self.progress = progress or (lambda _value, _message: None)
+        self.book_finished = book_finished or (lambda _index, _book, _output: None)
+        self.completed: list[Path] = []
+        self._cancel_event = threading.Event()
+        self._current_engine: ExportEngine | None = None
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+        if self._current_engine:
+            self._current_engine.cancel()
+
+    def run(self) -> list[Path]:
+        if not self.books:
+            raise ValueError("At least one book is required.")
+        self.destination_root = self.destination_root.expanduser().resolve()
+        if not self.destination_root.exists():
+            raise ValueError(f"Destination folder does not exist: {self.destination_root}")
+        if not self.destination_root.is_dir():
+            raise ValueError(f"Destination is not a folder: {self.destination_root}")
+
+        total_books = len(self.books)
+        for index, book in enumerate(self.books):
+            self._raise_if_cancelled()
+            output = book_output_path(self.destination_root, book.metadata)
+            created_directories = self._ensure_output_parent(output.parent)
+
+            def book_progress(value: int, message: str, *, book_index: int = index) -> None:
+                overall = int(((book_index + min(100, max(0, value)) / 100) / total_books) * 100)
+                self.progress(overall, f"Book {book_index + 1} of {total_books}: {message}")
+
+            engine = ExportEngine(
+                book.chapters,
+                output,
+                metadata_for_book(book.metadata),
+                book.cover,
+                book.bitrate,
+                book.channel_mode,
+                self.ffmpeg_path,
+                self.ffprobe_path,
+                book_progress,
+            )
+            self._current_engine = engine
+            try:
+                completed_output = engine.run()
+            except BaseException:
+                self._remove_empty_directories(created_directories)
+                raise
+            finally:
+                self._current_engine = None
+
+            self.completed.append(completed_output)
+            self.book_finished(index, book, completed_output)
+            self.progress(
+                int(((index + 1) / total_books) * 100),
+                f"Saved book {index + 1} of {total_books}: {completed_output.name}",
+            )
+        return list(self.completed)
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancel_event.is_set():
+            raise ExportCancelled
+
+    @staticmethod
+    def _ensure_output_parent(path: Path) -> list[Path]:
+        missing: list[Path] = []
+        current = path
+        while not current.exists():
+            missing.append(current)
+            current = current.parent
+        path.mkdir(parents=True, exist_ok=True)
+        return missing
+
+    @staticmethod
+    def _remove_empty_directories(directories: Sequence[Path]) -> None:
+        for directory in directories:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass

@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from audiobook_forge.models import BookMetadata, Chapter
-from audiobook_forge.project_io import load_project, save_project
+from audiobook_forge.models import Book, BookMetadata, Chapter
+from audiobook_forge.project_io import load_project, save_batch_project, save_project
 
 
 def test_project_round_trip(tmp_path: Path) -> None:
@@ -34,3 +34,29 @@ def test_project_loader_rejects_invalid_schemas(tmp_path: Path, payload: str) ->
     project.write_text(payload, encoding="utf-8")
     with pytest.raises(ValueError):
         load_project(project)
+
+
+def test_batch_project_round_trip(tmp_path: Path) -> None:
+    project = tmp_path / "batch.json"
+    source = tmp_path / "chapter.mp3"
+    cover = tmp_path / "cover.jpg"
+    books = [
+        Book(
+            chapters=[Chapter(source, "Opening", 12.5, 1)],
+            metadata=BookMetadata(title="Book", author="Author", series="Series"),
+            cover=cover,
+            bitrate=128,
+            channel_mode="Force stereo",
+            source_name="Source folder",
+            book_id="book-id",
+        )
+    ]
+
+    save_batch_project(project, books, tmp_path / "output")
+    payload = load_project(project)
+
+    assert payload["version"] == 2
+    assert payload["destination_root"] == str((tmp_path / "output").resolve())
+    assert payload["books"][0]["id"] == "book-id"
+    assert payload["books"][0]["metadata"]["series"] == "Series"
+    assert payload["books"][0]["bitrate"] == 128

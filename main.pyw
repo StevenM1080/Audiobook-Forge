@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+from copy import deepcopy
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QSettings, QThread, Qt, Signal
@@ -22,21 +23,30 @@ from PySide6.QtWidgets import (
     QPushButton,
     QComboBox,
     QSplitter,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from audiobook_forge.exporter import ExportCancelled, ExportEngine, format_time, metadata_value
+from audiobook_forge.exporter import (
+    BatchExportEngine,
+    ExportCancelled,
+    ExportEngine,
+    format_time,
+    metadata_value,
+)
 from audiobook_forge.media import common_tags, probe_audio, supported_audio_files
 from audiobook_forge.models import (
     BookMetadata,
+    Book,
     Chapter,
     SUPPORTED_AUDIO_EXTENSIONS,
     estimate_output_bytes,
+    book_output_path,
     natural_sort_key,
-    safe_output_stem,
 )
-from audiobook_forge.project_io import load_project, save_project
+from audiobook_forge.project_io import load_project, save_batch_project
 
 AUDIO_EXTENSIONS = SUPPORTED_AUDIO_EXTENSIONS
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -79,6 +89,94 @@ class DropList(QListWidget):
             event.acceptProposedAction()
         else:
             super().dropEvent(event)
+
+
+BOOK_ROLE = Qt.ItemDataRole.UserRole
+CHAPTER_PATH_ROLE = Qt.ItemDataRole.UserRole + 1
+CHAPTER_TITLE_ROLE = Qt.ItemDataRole.UserRole + 2
+CHAPTER_DURATION_ROLE = Qt.ItemDataRole.UserRole + 3
+
+
+class DropTree(QTreeWidget):
+    paths_dropped = Signal(list)
+    structure_changed = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QTreeWidget.DragDropMode.InternalMove)
+        self.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
+        self.setColumnCount(3)
+        self.setHeaderHidden(True)
+        self.setIndentation(18)
+        self.setAlternatingRowColors(False)
+        self.setUniformRowHeights(True)
+        self.setColumnWidth(0, 36)
+        self.setColumnWidth(2, 84)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        elif event.mimeData().hasFormat("application/x-qabstractitemmodeldatalist"):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QDropEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        if event.mimeData().hasFormat("application/x-qabstractitemmodeldatalist"):
+            target = self.itemAt(event.position().toPoint())
+            target_book = target.parent() if target and target.parent() else target
+            for source in self.selectedItems():
+                source_book = source.parent()
+                if source_book is None and target is not None and target.parent() is not None:
+                    event.ignore()
+                    return
+                if source_book is not None and target_book is not source_book:
+                    event.ignore()
+                    return
+                if source_book is not None and target is source_book:
+                    event.ignore()
+                    return
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if event.mimeData().hasUrls():
+            paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
+            audio_paths = [path for path in paths if path.is_file() and path.suffix.casefold() in AUDIO_EXTENSIONS]
+            folders = [path for path in paths if path.is_dir()]
+            if audio_paths or folders:
+                self.paths_dropped.emit(audio_paths + folders)
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+            return
+
+        if event.mimeData().hasFormat("application/x-qabstractitemmodeldatalist"):
+            target = self.itemAt(event.position().toPoint())
+            target_book = target.parent() if target and target.parent() else target
+            for source in self.selectedItems():
+                source_book = source.parent()
+                if source_book is None and target is not None and target.parent() is not None:
+                    event.ignore()
+                    return
+                if source_book is not None and target_book is not source_book:
+                    event.ignore()
+                    return
+                if source_book is not None and target is source_book:
+                    event.ignore()
+                    return
+            event.setDropAction(Qt.DropAction.MoveAction)
+            super().dropEvent(event)
+            self.structure_changed.emit()
+            return
+        super().dropEvent(event)
 
 
 class CoverDrop(QFrame):
@@ -167,20 +265,89 @@ class ConversionWorker(QObject):
             self.finished.emit(output)
 
 
+class BatchConversionWorker(QObject):
+    progress = Signal(int, str)
+    book_finished = Signal(str, str)
+    finished = Signal(list)
+    failed = Signal(str, int)
+    cancelled = Signal(int)
+
+    def __init__(self, books: list[Book], destination_root: Path, ffmpeg_path: str | None, ffprobe_path: str | None) -> None:
+        super().__init__()
+        self.engine = BatchExportEngine(
+            books,
+            destination_root,
+            ffmpeg_path,
+            ffprobe_path,
+            self.progress.emit,
+            lambda _index, book, output: self.book_finished.emit(book.book_id, str(output)),
+        )
+
+    def cancel(self) -> None:
+        self.engine.cancel()
+
+    def run(self) -> None:
+        try:
+            outputs = self.engine.run()
+        except ExportCancelled:
+            self.cancelled.emit(len(self.engine.completed))
+        except Exception as error:
+            self.failed.emit(str(error), len(self.engine.completed))
+        else:
+            self.finished.emit([str(output) for output in outputs])
+
+
 class MainWindow(QMainWindow):
     def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
         self.settings = settings if settings is not None else QSettings("AudiobookForge", "AudiobookForge")
-        self.chapters: list[Chapter] = []
-        self.cover: Path | None = None
+        self.books: list[Book] = []
+        self.selected_book_id: str | None = None
+        self.destination_root: Path | None = None
+        self._pending_cover: Path | None = None
+        self._loading_book = False
+        self._legacy_chapters_assignment = False
         self.thread: QThread | None = None
-        self.worker: ConversionWorker | None = None
+        self.worker: BatchConversionWorker | None = None
         self.project_path: Path | None = None
         self.busy_actions = []
         self.setWindowTitle("Audiobook Forge")
         self._build_ui()
         self._build_menu()
         self._restore_settings()
+
+    @property
+    def chapters(self) -> list[Chapter]:
+        """Compatibility view for older callers that used the single-book API."""
+
+        if len(self.books) == 1:
+            return self.books[0].chapters
+        return [chapter for book in self.books for chapter in book.chapters]
+
+    @chapters.setter
+    def chapters(self, chapters: list[Chapter]) -> None:
+        if not self.books:
+            self.books = [Book(chapters=list(chapters), source_name="Imported book")]
+            self.selected_book_id = self.books[0].book_id
+        elif len(self.books) == 1:
+            self.books[0].chapters = list(chapters)
+        else:
+            self.books = [Book(chapters=list(chapters), source_name="Imported book")]
+            self.selected_book_id = self.books[0].book_id
+        self._legacy_chapters_assignment = True
+
+    @property
+    def cover(self) -> Path | None:
+        book = self._selected_book()
+        return book.cover if book else self._pending_cover
+
+    @cover.setter
+    def cover(self, path: Path | None) -> None:
+        book = self._selected_book()
+        if book:
+            book.cover = path
+        else:
+            self._pending_cover = path
 
     def _restore_settings(self) -> None:
         # Geometry is intentionally session-local. Remove the legacy value so
@@ -224,12 +391,12 @@ class MainWindow(QMainWindow):
         brand.setObjectName("brand")
         header.addWidget(brand)
         header.addStretch()
-        self.count_label = QLabel("0 CHAPTERS")
+        self.count_label = QLabel("0 BOOKS  ·  0 CHAPTERS")
         self.count_label.setObjectName("countLabel")
         header.addWidget(self.count_label)
         outer.addLayout(header)
 
-        intro = QLabel("Turn a folder of audio tracks into one polished, chapterized M4B.")
+        intro = QLabel("Turn folders of audio tracks into a batch of polished, chapterized M4Bs.")
         intro.setObjectName("intro")
         outer.addWidget(intro)
 
@@ -237,14 +404,16 @@ class MainWindow(QMainWindow):
         splitter.setChildrenCollapsible(False)
         outer.addWidget(splitter, 1)
 
-        self.chapter_group = QGroupBox("CHAPTERS")
+        self.chapter_group = QGroupBox("BOOKS")
         left_layout = QVBoxLayout(self.chapter_group)
-        self.file_list = DropList()
-        self.file_list.paths_dropped.connect(self.add_paths)
-        self.file_list.itemChanged.connect(self._chapter_title_changed)
-        self.file_list.model().rowsMoved.connect(self._manual_reorder)
-        left_layout.addWidget(self.file_list)
-        hint = QLabel("Drop audio files or a folder. Double-click titles to edit.")
+        self.file_tree = DropTree()
+        self.file_list = self.file_tree
+        self.file_tree.paths_dropped.connect(self.add_paths)
+        self.file_tree.itemChanged.connect(self._tree_item_changed)
+        self.file_tree.itemSelectionChanged.connect(self._tree_selection_changed)
+        self.file_tree.structure_changed.connect(self._tree_structure_changed)
+        left_layout.addWidget(self.file_tree)
+        hint = QLabel("Drop folders or audio files. Expand a book and double-click chapter titles to edit.")
         hint.setObjectName("hint")
         left_layout.addWidget(hint)
         row = QHBoxLayout()
@@ -303,25 +472,31 @@ class MainWindow(QMainWindow):
         cover_button.clicked.connect(self.browse_cover)
         cover_row.addWidget(cover_button)
         details.addLayout(cover_row, 7, 1)
-        details.addWidget(QLabel("Export to"), 8, 0)
+        details.addWidget(QLabel("Destination"), 8, 0)
         output_row = QHBoxLayout()
         self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("Choose an output .m4b file")
+        self.output_edit.setPlaceholderText("Choose a batch destination folder")
         output_button = QPushButton("Browse")
         output_button.clicked.connect(self.browse_output)
         output_row.addWidget(self.output_edit)
         output_row.addWidget(output_button)
         details.addLayout(output_row, 8, 1)
-        details.addWidget(QLabel("Quality"), 9, 0)
+        self.output_edit.textChanged.connect(self._destination_changed)
+        self.output_preview = QLabel("Output path appears here after a book is selected.")
+        self.output_preview.setWordWrap(True)
+        self.output_preview.setObjectName("hint")
+        details.addWidget(self.output_preview, 9, 0, 1, 2)
+        details.addWidget(QLabel("Quality"), 10, 0)
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(["64 kbps  Small", "96 kbps  Standard", "128 kbps  High", "160 kbps  Very High"])
         self.quality_combo.setCurrentIndex(1)
-        details.addWidget(self.quality_combo, 9, 1)
-        self.quality_combo.currentIndexChanged.connect(self._refresh_count)
-        details.addWidget(QLabel("Channels"), 10, 0)
+        details.addWidget(self.quality_combo, 10, 1)
+        self.quality_combo.currentIndexChanged.connect(self._book_settings_changed)
+        details.addWidget(QLabel("Channels"), 11, 0)
         self.channel_combo = QComboBox()
         self.channel_combo.addItems(["Preserve source", "Force mono", "Force stereo"])
-        details.addWidget(self.channel_combo, 10, 1)
+        details.addWidget(self.channel_combo, 11, 1)
+        self.channel_combo.currentTextChanged.connect(self._book_settings_changed)
         details.setColumnStretch(1, 1)
         splitter.addWidget(self.details_group)
         splitter.setSizes([620, 400])
@@ -344,7 +519,7 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_conversion)
         footer.addWidget(self.cancel_button)
-        self.convert_button = QPushButton("MAKE M4B  →")
+        self.convert_button = QPushButton("MAKE ALL M4Bs  →")
         self.convert_button.setObjectName("convertButton")
         self.convert_button.clicked.connect(self.convert)
         footer.addWidget(self.convert_button)
@@ -357,6 +532,8 @@ class MainWindow(QMainWindow):
             self.output_edit.placeholderText()
         ) + 32
         self.output_edit.setMinimumWidth(output_hint_width)
+        for edit in self.metadata_edits.values():
+            edit.textChanged.connect(self._book_form_changed)
 
     def browse_audio(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Choose audio files", self.settings.value("input_directory", ""), "Audio (*.mp3 *.m4a *.aac *.flac *.wav *.ogg)")
@@ -371,133 +548,359 @@ class MainWindow(QMainWindow):
             self.add_paths([Path(path)])
 
     def add_paths(self, paths: list[Path]) -> None:
-        self._sync_chapters_from_list()
-        files = []
+        self._commit_current_book()
+        self._sync_tree()
+        groups: list[tuple[Path | None, list[Path]]] = []
+        loose_files: list[Path] = []
         for path in paths:
             if path.is_dir():
-                files.extend(supported_audio_files(path))
+                groups.append((path, sorted(supported_audio_files(path), key=natural_sort_key)))
             elif path.is_file() and path.suffix.casefold() in AUDIO_EXTENSIONS:
-                files.append(path)
-        existing = {chapter.path for chapter in self.chapters}
-        imported: list[Chapter] = []
-        for path in sorted(files, key=natural_sort_key):
-            resolved_path = path.resolve()
-            if resolved_path in existing:
+                loose_files.append(path)
+        if loose_files:
+            groups.append((None, sorted(loose_files, key=natural_sort_key)))
+
+        existing = {chapter.path for book in self.books for chapter in book.chapters}
+        new_books: list[Book] = []
+        legacy_target = (
+            self.books[0]
+            if self._legacy_chapters_assignment and len(self.books) == 1 and not any(source for source, _files in groups)
+            else None
+        )
+        for source, files in groups:
+            imported: list[Chapter] = []
+            for path in files:
+                resolved_path = path.resolve()
+                if resolved_path in existing:
+                    continue
+                try:
+                    chapter = probe_audio(resolved_path)
+                except ValueError as error:
+                    QMessageBox.warning(self, "Could not read audio", str(error))
+                    continue
+                imported.append(chapter)
+                existing.add(resolved_path)
+            if not imported:
+                if files:
+                    QMessageBox.warning(
+                        self,
+                        "No audio tracks found",
+                        f"No readable supported audio files were found in {source or 'the selected files'}.",
+                    )
                 continue
-            try:
-                chapter = probe_audio(resolved_path)
-            except ValueError as error:
-                QMessageBox.warning(self, "Could not read audio", str(error))
+            if legacy_target is not None:
+                legacy_target.chapters.extend(imported)
+                self._sort_book(legacy_target)
                 continue
-            self.chapters.append(chapter)
-            imported.append(chapter)
-            existing.add(resolved_path)
+            book = self._book_from_import(imported, source)
+            new_books.append(book)
+
+        self._legacy_chapters_assignment = False
+        self.books.extend(new_books)
+        self._render_books(new_books[-1].book_id if new_books else self.selected_book_id)
+
+    def _book_from_import(self, chapters: list[Chapter], source: Path | None) -> Book:
+        tags = common_tags(chapters)
+        source_name = source.name if source else self._loose_group_name(chapters)
+        metadata = BookMetadata(
+            title=tags.get("album", "") or source_name,
+            author=tags.get("albumartist", "") or tags.get("artist", ""),
+            narrator=tags.get("composer", ""),
+            year=tags.get("date", ""),
+            genre=tags.get("genre", ""),
+        )
+        book = Book(
+            chapters=chapters,
+            metadata=metadata,
+            bitrate=self._default_bitrate(),
+            channel_mode=self._default_channel_mode(),
+            source_name=source_name,
+        )
+        self._sort_book(book)
+        return book
+
+    @staticmethod
+    def _loose_group_name(chapters: list[Chapter]) -> str:
+        parents = {chapter.path.parent for chapter in chapters}
+        if len(parents) == 1:
+            return next(iter(parents)).name
+        return "Untitled book"
+
+    def _default_bitrate(self) -> int:
+        try:
+            index = int(self.settings.value("bitrate_index", 1))
+        except (TypeError, ValueError):
+            index = 1
+        return [64, 96, 128, 160][index if index in range(4) else 1]
+
+    def _default_channel_mode(self) -> str:
+        value = self.settings.value("channel_mode", "Preserve source")
+        return value if value in {"Preserve source", "Force mono", "Force stereo"} else "Preserve source"
+
+    def _sort_book(self, book: Book) -> None:
         if self.sort_combo.currentIndex() == 0:
-            self.chapters.sort(key=lambda chapter: natural_sort_key(chapter.path))
+            book.chapters.sort(key=lambda chapter: natural_sort_key(chapter.path))
         elif self.sort_combo.currentIndex() == 1:
-            self.chapters.sort(
-                key=lambda chapter: (
-                    chapter.track_number is None,
-                    chapter.track_number or 0,
-                    natural_sort_key(chapter.path),
-                )
-            )
-        self._render_chapters()
-        if imported:
-            tags = common_tags(imported)
-            candidates = {
-                "title": tags.get("album", ""),
-                "author": tags.get("albumartist", tags.get("artist", "")),
-                "composer": tags.get("composer", ""),
-                "date": tags.get("date", ""),
-                "genre": tags.get("genre", ""),
-            }
-            edits = {"title": self.title_edit, "author": self.author_edit, "composer": self.metadata_edits["composer"], "date": self.metadata_edits["date"], "genre": self.metadata_edits["genre"]}
-            for key, value in candidates.items():
-                if value and not edits[key].text().strip():
-                    edits[key].setText(value)
+            book.chapters.sort(key=lambda chapter: (chapter.track_number is None, chapter.track_number or 0, natural_sort_key(chapter.path)))
 
     def clear_files(self) -> None:
-        self.chapters.clear()
-        self.file_list.clear()
+        self.books.clear()
+        self.selected_book_id = None
+        self._pending_cover = None
+        self.file_tree.clear()
+        self._clear_form()
         self._refresh_count()
 
     def remove_selected(self) -> None:
-        selected = {item.data(Qt.ItemDataRole.UserRole) for item in self.file_list.selectedItems()}
-        self.chapters = [chapter for chapter in self.chapters if chapter.path not in selected]
-        self._render_chapters()
+        self._commit_current_book()
+        selected_items = self.file_tree.selectedItems()
+        if not selected_items:
+            return
+        remove_book_ids: set[str] = set()
+        remove_chapters: dict[str, set[Path]] = {}
+        for item in selected_items:
+            book_item = item.parent() or item
+            book_id = str(book_item.data(0, BOOK_ROLE) or "")
+            if item.parent() is None:
+                remove_book_ids.add(book_id)
+            else:
+                remove_chapters.setdefault(book_id, set()).add(Path(item.data(1, CHAPTER_PATH_ROLE)))
+        remaining: list[Book] = []
+        for book in self.books:
+            if book.book_id in remove_book_ids:
+                continue
+            paths = remove_chapters.get(book.book_id, set())
+            book.chapters = [chapter for chapter in book.chapters if chapter.path not in paths]
+            if book.chapters:
+                remaining.append(book)
+        self.books = remaining
+        self.selected_book_id = self.books[0].book_id if self.books else None
+        self._render_books(self.selected_book_id)
+
+    def _render_books(self, preferred_book_id: str | None = None) -> None:
+        expanded = {
+            str(self.file_tree.topLevelItem(index).data(0, BOOK_ROLE))
+            for index in range(self.file_tree.topLevelItemCount())
+            if self.file_tree.topLevelItem(index).isExpanded()
+        }
+        target_id = preferred_book_id if any(book.book_id == preferred_book_id for book in self.books) else self.selected_book_id
+        self.file_tree.blockSignals(True)
+        self.file_tree.clear()
+        selected_item: QTreeWidgetItem | None = None
+        for book in self.books:
+            book_item = QTreeWidgetItem()
+            book_item.setText(0, book.display_title)
+            book_item.setData(0, BOOK_ROLE, book.book_id)
+            book_item.setFirstColumnSpanned(True)
+            book_item.setFlags(book_item.flags() | Qt.ItemFlag.ItemIsDropEnabled)
+            self.file_tree.addTopLevelItem(book_item)
+            for index, chapter in enumerate(book.chapters, start=1):
+                chapter_item = QTreeWidgetItem(book_item)
+                chapter_item.setText(0, f"{index:02d}")
+                chapter_item.setText(1, chapter.title)
+                chapter_item.setText(2, self._format_time(chapter.duration))
+                chapter_item.setData(1, CHAPTER_PATH_ROLE, str(chapter.path))
+                chapter_item.setData(1, CHAPTER_TITLE_ROLE, chapter.title)
+                chapter_item.setData(1, CHAPTER_DURATION_ROLE, chapter.duration)
+                chapter_item.setFlags(chapter_item.flags() | Qt.ItemFlag.ItemIsEditable)
+            book_item.setExpanded(book.book_id in expanded)
+            if book.book_id == target_id:
+                selected_item = book_item
+        self.file_tree.blockSignals(False)
+        self.selected_book_id = target_id if selected_item else (self.books[0].book_id if self.books else None)
+        if selected_item:
+            self.file_tree.setCurrentItem(selected_item)
+        elif self.books:
+            self.file_tree.setCurrentItem(self.file_tree.topLevelItem(0))
+        else:
+            self._clear_form()
+        if self.books:
+            self._load_selected_book()
+        self._refresh_count()
 
     def _render_chapters(self) -> None:
-        self.file_list.blockSignals(True)
-        self.file_list.clear()
-        for chapter in self.chapters:
-            item = QListWidgetItem()
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-            item.setText(chapter.title)
-            item.setData(Qt.ItemDataRole.UserRole, chapter.path)
-            item.setData(Qt.ItemDataRole.UserRole + 1, chapter.duration)
-            item.setData(Qt.ItemDataRole.UserRole + 2, chapter.title)
-            self.file_list.addItem(item)
-        self.file_list.blockSignals(False)
-        self._renumber_rows()
-        self._refresh_count()
+        """Compatibility alias for the previous single-book UI."""
+
+        self._render_books(self.selected_book_id)
 
     def _renumber_rows(self) -> None:
-        previous = self.file_list.blockSignals(True)
-        try:
-            for index in range(self.file_list.count()):
-                item = self.file_list.item(index)
-                duration = float(item.data(Qt.ItemDataRole.UserRole + 1) or 0)
-                title = item.data(Qt.ItemDataRole.UserRole + 2) or item.text()
-                item.setText(f"{index + 1:02d}   {title}   {self._format_time(duration)}")
-        finally:
-            self.file_list.blockSignals(previous)
+        self._render_books(self.selected_book_id)
 
     def _sync_chapters_from_list(self) -> None:
-        chapters_by_path = {chapter.path: chapter for chapter in self.chapters}
-        ordered = []
-        for index in range(self.file_list.count()):
-            item = self.file_list.item(index)
-            path = item.data(Qt.ItemDataRole.UserRole)
-            chapter = chapters_by_path[path]
-            chapter.title = str(item.data(Qt.ItemDataRole.UserRole + 2) or item.text()).strip()
-            ordered.append(chapter)
-        self.chapters = ordered
-        self._renumber_rows()
+        self._sync_tree()
+
+    def _sync_tree(self) -> None:
+        books_by_id = {book.book_id: book for book in self.books}
+        ordered: list[Book] = []
+        for index in range(self.file_tree.topLevelItemCount()):
+            book_item = self.file_tree.topLevelItem(index)
+            book_id = str(book_item.data(0, BOOK_ROLE) or "")
+            book = books_by_id.get(book_id)
+            if book is None:
+                continue
+            chapters_by_path = {chapter.path: chapter for chapter in book.chapters}
+            ordered_chapters: list[Chapter] = []
+            for child_index in range(book_item.childCount()):
+                child = book_item.child(child_index)
+                path = Path(str(child.data(1, CHAPTER_PATH_ROLE)))
+                chapter = chapters_by_path.get(path)
+                if chapter is None:
+                    continue
+                chapter.title = str(child.data(1, CHAPTER_TITLE_ROLE) or child.text(1)).strip()
+                ordered_chapters.append(chapter)
+            book.chapters = ordered_chapters
+            ordered.append(book)
+        self.books = ordered
         self._refresh_count()
 
-    def apply_sort(self, index: int) -> None:
-        self._sync_chapters_from_list()
-        if index == 0:
-            self.chapters.sort(key=lambda chapter: natural_sort_key(chapter.path))
-        elif index == 1:
-            self.chapters.sort(key=lambda chapter: (chapter.track_number is None, chapter.track_number or 0, natural_sort_key(chapter.path)))
-        self._render_chapters()
+    def _tree_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        if self._loading_book or item.parent() is None or column != 1:
+            return
+        previous = self.file_tree.blockSignals(True)
+        item.setData(1, CHAPTER_TITLE_ROLE, item.text(1).strip())
+        self.file_tree.blockSignals(previous)
+        self._sync_tree()
 
-    def _manual_reorder(self, *_args) -> None:
-        self._sync_chapters_from_list()
+    def _tree_structure_changed(self) -> None:
+        self._sync_tree()
         self.sort_combo.blockSignals(True)
         self.sort_combo.setCurrentIndex(2)
         self.sort_combo.blockSignals(False)
 
+    def _manual_reorder(self, *_args) -> None:
+        self._tree_structure_changed()
+
     def _chapter_title_changed(self, item: QListWidgetItem) -> None:
-        title = item.text().split("   ", 1)[-1].rsplit("   ", 1)[0].strip()
-        item.setData(Qt.ItemDataRole.UserRole + 2, title)
-        self._sync_chapters_from_list()
+        self._tree_item_changed(item, 1)
+
+    def apply_sort(self, index: int) -> None:
+        self._commit_current_book()
+        self._sync_tree()
+        if index in (0, 1):
+            for book in self.books:
+                self._sort_book(book)
+        self._render_books(self.selected_book_id)
+
+    def _selected_book(self) -> Book | None:
+        if self.selected_book_id is None:
+            return None
+        return next((book for book in self.books if book.book_id == self.selected_book_id), None)
+
+    @staticmethod
+    def _book_id_for_item(item: QTreeWidgetItem | None) -> str | None:
+        if item is None:
+            return None
+        book_item = item.parent() or item
+        value = book_item.data(0, BOOK_ROLE)
+        return str(value) if value else None
+
+    def _tree_selection_changed(self) -> None:
+        item = self.file_tree.currentItem()
+        book_id = self._book_id_for_item(item)
+        if book_id == self.selected_book_id:
+            return
+        self._commit_current_book()
+        self.selected_book_id = book_id
+        self._load_selected_book()
+
+    def _load_selected_book(self) -> None:
+        book = self._selected_book()
+        self._loading_book = True
+        try:
+            if book is None:
+                self._clear_form()
+                return
+            values = {
+                "title": book.metadata.title,
+                "artist": book.metadata.author,
+                "composer": book.metadata.narrator,
+                "grouping": book.metadata.series,
+                "series_number": book.metadata.series_number,
+                "date": book.metadata.year,
+                "genre": book.metadata.genre,
+            }
+            for key, edit in self.metadata_edits.items():
+                edit.setText(values.get(key, ""))
+            self.cover_drop.clear()
+            if book.cover:
+                self.cover_drop.set_path(book.cover)
+            self.quality_combo.setCurrentIndex({64: 0, 96: 1, 128: 2, 160: 3}.get(book.bitrate, 1))
+            self.channel_combo.setCurrentText(book.channel_mode)
+        finally:
+            self._loading_book = False
+        self._refresh_output_preview()
+
+    def _clear_form(self) -> None:
+        self._loading_book = True
+        try:
+            for edit in self.metadata_edits.values():
+                edit.clear()
+            self.cover_drop.clear()
+            self.quality_combo.setCurrentIndex(1)
+            self.channel_combo.setCurrentText("Preserve source")
+        finally:
+            self._loading_book = False
+        self._refresh_output_preview()
+
+    def _commit_current_book(self) -> None:
+        book = self._selected_book()
+        if book is None or self._loading_book:
+            return
+        book.metadata = BookMetadata(
+            title=self.title_edit.text().strip(),
+            author=self.author_edit.text().strip(),
+            narrator=self.metadata_edits["composer"].text().strip(),
+            series=self.metadata_edits["grouping"].text().strip(),
+            series_number=self.metadata_edits["series_number"].text().strip(),
+            year=self.metadata_edits["date"].text().strip(),
+            genre=self.metadata_edits["genre"].text().strip(),
+        )
+        book.cover = self.cover_drop.path.resolve() if self.cover_drop.path else None
+        book.bitrate = [64, 96, 128, 160][self.quality_combo.currentIndex()]
+        book.channel_mode = self.channel_combo.currentText()
+
+    def _book_form_changed(self, *_args) -> None:
+        if self._loading_book:
+            return
+        self._commit_current_book()
+        self._update_book_item()
+        self._refresh_output_preview()
+        self._refresh_count()
+
+    def _book_settings_changed(self, *_args) -> None:
+        self._book_form_changed()
+
+    def _update_book_item(self) -> None:
+        book = self._selected_book()
+        if book is None:
+            return
+        for index in range(self.file_tree.topLevelItemCount()):
+            item = self.file_tree.topLevelItem(index)
+            if item.data(0, BOOK_ROLE) == book.book_id:
+                self.file_tree.blockSignals(True)
+                item.setText(0, book.display_title)
+                self.file_tree.blockSignals(False)
+                return
 
     @staticmethod
     def _format_time(seconds: float) -> str:
         return format_time(seconds)
 
     def _refresh_count(self) -> None:
-        self.count_label.setText(f"{len(self.chapters)} CHAPTERS")
-        total = sum(chapter.duration for chapter in self.chapters)
-        bitrate = [64, 96, 128, 160][self.quality_combo.currentIndex()] if hasattr(self, "quality_combo") else 96
-        estimate = estimate_output_bytes(total, bitrate)
+        chapter_count = sum(len(book.chapters) for book in self.books)
+        self.count_label.setText(f"{len(self.books)} BOOKS  ·  {chapter_count} CHAPTERS")
+        total = sum(chapter.duration for book in self.books for chapter in book.chapters)
+        estimate = sum(
+            estimate_output_bytes(sum(chapter.duration for chapter in book.chapters), book.bitrate)
+            for book in self.books
+        )
         self.runtime_label.setText(f"Runtime: {self._format_time(total)}  |  Estimated output: ~{estimate / 1_000_000:.0f} MB")
 
     def _cover_changed(self, path: Path) -> None:
+        if self._loading_book:
+            return
         self.cover = path.resolve()
+        self._refresh_output_preview()
 
     def browse_cover(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Choose cover image", "", "Images (*.jpg *.jpeg *.png *.webp)")
@@ -514,13 +917,25 @@ class MainWindow(QMainWindow):
         if path:
             self.settings.setValue("ffprobe_path", path)
 
+    def _refresh_output_preview(self) -> None:
+        book = self._selected_book()
+        if book is None:
+            self.output_preview.setText("Output path appears here after a book is selected.")
+            return
+        root_text = self.output_edit.text().strip()
+        if not root_text:
+            self.output_preview.setText("Choose a destination folder to preview this book's output path.")
+            return
+        self.output_preview.setText(str(book_output_path(Path(root_text).expanduser(), book.metadata)))
+
+    def _destination_changed(self, value: str) -> None:
+        self.destination_root = Path(value).expanduser().resolve() if value.strip() else None
+        self._refresh_output_preview()
+
     def new_project(self) -> None:
         self.clear_files()
-        for edit in self.metadata_edits.values():
-            edit.clear()
-        self.cover = None
-        self.cover_drop.clear()
         self.output_edit.clear()
+        self.destination_root = None
         self.project_path = None
 
     def save_project(self) -> None:
@@ -537,27 +952,11 @@ class MainWindow(QMainWindow):
                 self.project_path = project_path
 
     def _write_project(self, path: Path) -> bool:
-        self._sync_chapters_from_list()
-        metadata = BookMetadata(
-            title=self.title_edit.text().strip(),
-            author=self.author_edit.text().strip(),
-            narrator=self.metadata_edits["composer"].text().strip(),
-            series=self.metadata_edits["grouping"].text().strip(),
-            series_number=self.metadata_edits["series_number"].text().strip(),
-            year=self.metadata_edits["date"].text().strip(),
-            genre=self.metadata_edits["genre"].text().strip(),
-        )
-        bitrate = [64, 96, 128, 160][self.quality_combo.currentIndex()]
+        self._commit_current_book()
+        self._sync_tree()
+        destination = Path(self.output_edit.text().strip()).expanduser() if self.output_edit.text().strip() else None
         try:
-            save_project(
-                path,
-                self.chapters,
-                metadata,
-                self.cover,
-                Path(self.output_edit.text()) if self.output_edit.text() else None,
-                bitrate,
-                self.channel_combo.currentText(),
-            )
+            save_batch_project(path, self.books, destination)
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Could not save project", str(error))
             return False
@@ -571,7 +970,6 @@ class MainWindow(QMainWindow):
         try:
             project_path = Path(path)
             payload = load_project(project_path)
-            saved_metadata = payload.get("metadata", {})
 
             def project_file(saved_path: str) -> Path:
                 candidate = Path(saved_path).expanduser()
@@ -579,47 +977,67 @@ class MainWindow(QMainWindow):
                     candidate = project_path.parent / candidate
                 return candidate.resolve()
 
-            loaded_chapters = [
-                Chapter(
-                    project_file(item["path"]),
-                    item["title"],
-                    float(item["duration"]),
-                    item.get("track_number"),
-                    item.get("channels"),
-                    item.get("sample_rate"),
+            if payload["version"] == 1:
+                saved_metadata = payload.get("metadata", {})
+                loaded_chapters = [self._chapter_from_payload(item, project_file) for item in payload["chapters"]]
+                legacy_metadata = BookMetadata(
+                    title=saved_metadata.get("title", ""),
+                    author=saved_metadata.get("author", ""),
+                    narrator=saved_metadata.get("narrator", ""),
+                    series=saved_metadata.get("series", ""),
+                    series_number=saved_metadata.get("series_number", ""),
+                    year=saved_metadata.get("year", ""),
+                    genre=saved_metadata.get("genre", ""),
                 )
-                for item in payload["chapters"]
-            ]
-            loaded_cover = project_file(payload["cover"]) if payload.get("cover") else None
-            loaded_output = str(project_file(payload["output"])) if payload.get("output") else ""
-            loaded_bitrate = {64: 0, 96: 1, 128: 2, 160: 3}.get(
-                payload.get("bitrate", 96), 1
-            )
-            loaded_channel_mode = payload.get("channel_mode", "Preserve source")
+                legacy_cover = project_file(payload["cover"]) if payload.get("cover") else None
+                source_name = legacy_metadata.title or (loaded_chapters[0].path.parent.name if loaded_chapters else "Imported book")
+                loaded_books = [
+                    Book(
+                        chapters=loaded_chapters,
+                        metadata=legacy_metadata,
+                        cover=legacy_cover,
+                        bitrate=payload.get("bitrate", 96),
+                        channel_mode=payload.get("channel_mode", "Preserve source"),
+                        source_name=source_name,
+                    )
+                ]
+                legacy_output = project_file(payload["output"]) if payload.get("output") else None
+                loaded_destination = legacy_output.parent if legacy_output else None
+            else:
+                loaded_books = []
+                for item in payload["books"]:
+                    metadata = item.get("metadata", {})
+                    loaded_books.append(
+                        Book(
+                            chapters=[self._chapter_from_payload(chapter, project_file) for chapter in item["chapters"]],
+                            metadata=BookMetadata(
+                                title=metadata.get("title", ""),
+                                author=metadata.get("author", ""),
+                                narrator=metadata.get("narrator", ""),
+                                series=metadata.get("series", ""),
+                                series_number=metadata.get("series_number", ""),
+                                year=metadata.get("year", ""),
+                                genre=metadata.get("genre", ""),
+                            ),
+                            cover=project_file(item["cover"]) if item.get("cover") else None,
+                            bitrate=item.get("bitrate", 96),
+                            channel_mode=item.get("channel_mode", "Preserve source"),
+                            source_name=item.get("source_name", ""),
+                            book_id=item.get("id") or Book().book_id,
+                        )
+                    )
+                loaded_destination = project_file(payload["destination_root"]) if payload.get("destination_root") else None
         except (OSError, KeyError, TypeError, ValueError) as error:
             QMessageBox.critical(self, "Could not open project", str(error))
             return
 
-        self.chapters = loaded_chapters
-        self._render_chapters()
-        try:
-            self.title_edit.setText(saved_metadata.get("title", ""))
-            self.author_edit.setText(saved_metadata.get("author", ""))
-            for key, metadata_key in {"composer": "narrator", "grouping": "series", "series_number": "series_number", "date": "year", "genre": "genre"}.items():
-                self.metadata_edits[key].setText(saved_metadata.get(metadata_key, ""))
-        except (AttributeError, TypeError) as error:
-            QMessageBox.critical(self, "Could not open project", str(error))
-            return
-        self.cover = loaded_cover
-        if self.cover and self.cover.is_file():
-            self.cover_drop.set_path(self.cover)
-        else:
-            self.cover_drop.clear()
-        self.output_edit.setText(loaded_output)
-        self.quality_combo.setCurrentIndex(loaded_bitrate)
-        self.channel_combo.setCurrentText(loaded_channel_mode)
+        self.books = loaded_books
+        self.selected_book_id = self.books[0].book_id if self.books else None
+        self.destination_root = loaded_destination
+        self.output_edit.setText(str(loaded_destination) if loaded_destination else "")
+        self._render_books(self.selected_book_id)
         self.project_path = Path(path)
-        missing = [chapter.path for chapter in self.chapters if not chapter.path.is_file()]
+        missing = [chapter.path for book in self.books for chapter in book.chapters if not chapter.path.is_file()]
         if missing:
             preview = "\n".join(str(item) for item in missing[:5])
             suffix = f"\n…and {len(missing) - 5} more" if len(missing) > 5 else ""
@@ -630,21 +1048,36 @@ class MainWindow(QMainWindow):
                 f"{preview}{suffix}\n\nRelocate or re-add them before exporting.",
             )
 
+    @staticmethod
+    def _chapter_from_payload(item: dict, project_file) -> Chapter:
+        return Chapter(
+            project_file(item["path"]),
+            item["title"],
+            float(item["duration"]),
+            item.get("track_number"),
+            item.get("channels"),
+            item.get("sample_rate"),
+        )
+
     def browse_output(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Export audiobook", self.settings.value("output_directory", "audiobook.m4b"), "M4B audiobook (*.m4b)")
+        path = QFileDialog.getExistingDirectory(self, "Choose batch destination folder", self.settings.value("output_directory", ""))
         if path:
             self.output_edit.setText(path)
-            self.settings.setValue("output_directory", str(Path(path).parent))
+            self.destination_root = Path(path).resolve()
+            self.settings.setValue("output_directory", path)
+            self._refresh_output_preview()
 
     def convert(self) -> None:
-        self._sync_chapters_from_list()
-        if not self.chapters:
-            QMessageBox.warning(self, "No chapters", "Drop at least one audio file before exporting.")
+        self._commit_current_book()
+        self._sync_tree()
+        if not self.books:
+            QMessageBox.warning(self, "No books", "Drop at least one audiobook folder or audio group before exporting.")
             return
-        if not self.title_edit.text().strip() or not self.author_edit.text().strip():
-            QMessageBox.warning(self, "Missing details", "Add a title and author before exporting.")
+        incomplete = [book.display_title for book in self.books if not book.metadata.title.strip() or not book.metadata.author.strip()]
+        if incomplete:
+            QMessageBox.warning(self, "Missing details", "Add a title and author for every book before exporting.\n\n" + "\n".join(incomplete[:8]))
             return
-        missing = [chapter.path for chapter in self.chapters if not chapter.path.is_file()]
+        missing = [chapter.path for book in self.books for chapter in book.chapters if not chapter.path.is_file()]
         if missing:
             QMessageBox.warning(
                 self,
@@ -653,77 +1086,41 @@ class MainWindow(QMainWindow):
                 "Re-add them or open a corrected project before exporting.",
             )
             return
-        if self.cover and not self.cover.is_file():
+        missing_covers = [book.cover for book in self.books if book.cover and not book.cover.is_file()]
+        if missing_covers:
             QMessageBox.warning(
                 self,
                 "Missing cover image",
-                "The selected cover image could not be found. Choose it again or start a new project.",
+                "One or more selected cover images could not be found. Choose them again or remove them before exporting.",
             )
             return
-        output = (
-            Path(self.output_edit.text().strip()).expanduser()
-            if self.output_edit.text().strip()
-            else self.chapters[0].path.with_name(
-                f"{safe_output_stem(self.title_edit.text())}.m4b"
-            )
+        if not self.output_edit.text().strip():
+            QMessageBox.warning(self, "Missing destination", "Choose a batch destination folder before exporting.")
+            return
+        destination = Path(self.output_edit.text().strip()).expanduser().resolve()
+        if not destination.exists() or not destination.is_dir():
+            QMessageBox.warning(self, "Missing destination folder", f"The destination folder does not exist:\n{destination}")
+            return
+        estimate = sum(
+            estimate_output_bytes(sum(chapter.duration for chapter in book.chapters), book.bitrate)
+            for book in self.books
         )
-        if not output.suffix:
-            output = output.with_suffix(".m4b")
-        elif output.suffix.casefold() != ".m4b":
-            QMessageBox.warning(
-                self,
-                "Invalid output type",
-                "Audiobook Forge exports .m4b files. Choose a filename ending in .m4b.",
-            )
-            return
-        if not output.parent.exists():
-            QMessageBox.warning(
-                self,
-                "Missing output folder",
-                f"The output folder does not exist:\n{output.parent}",
-            )
-            return
-        output = output.resolve()
-        if output.exists():
-            choice = QMessageBox.question(self, "Output already exists", f"Replace this file?\n{output}", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if choice != QMessageBox.StandardButton.Yes:
-                return
-        bitrate = [64, 96, 128, 160][self.quality_combo.currentIndex()]
-        estimate = estimate_output_bytes(sum(chapter.duration for chapter in self.chapters), bitrate)
         workspace_estimate = int(estimate * 2.2)
         try:
-            free_space = shutil.disk_usage(output.parent.resolve()).free
+            free_space = shutil.disk_usage(destination).free
         except OSError:
             free_space = workspace_estimate
         if free_space < workspace_estimate:
             choice = QMessageBox.warning(self, "Low disk space", f"The destination may not have enough free space for the output and temporary encoding files.\nEstimated output: {estimate / 1_000_000:.0f} MB", QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
             if choice != QMessageBox.StandardButton.Ok:
                 return
-        self.output_edit.setText(str(output))
         self._set_exporting(True)
         self.progress.setValue(0)
-        chapters = [
-            Chapter(
-                chapter.path,
-                chapter.title,
-                chapter.duration,
-                chapter.track_number,
-                chapter.channels,
-                chapter.sample_rate,
-            )
-            for chapter in self.chapters
-        ]
+        books = deepcopy(self.books)
         thread = QThread(self)
-        metadata = {key: edit.text().strip() for key, edit in self.metadata_edits.items()}
-        metadata["album"] = metadata.get("title", "")
-        metadata["album_artist"] = metadata.get("artist", "")
-        worker = ConversionWorker(
-            chapters,
-            output,
-            metadata,
-            self.cover,
-            bitrate,
-            self.channel_combo.currentText(),
+        worker = BatchConversionWorker(
+            books,
+            destination,
             self.settings.value("ffmpeg_path", "") or None,
             self.settings.value("ffprobe_path", "") or None,
         )
@@ -732,6 +1129,7 @@ class MainWindow(QMainWindow):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self.update_progress)
+        worker.book_finished.connect(self.book_conversion_finished)
         worker.finished.connect(self.conversion_finished)
         worker.failed.connect(self.conversion_failed)
         worker.cancelled.connect(self.conversion_cancelled)
@@ -775,18 +1173,24 @@ class MainWindow(QMainWindow):
         self.settings.setValue("channel_mode", self.channel_combo.currentText())
         event.accept()
 
-    def conversion_finished(self, output: Path) -> None:
-        self.status_label.setText(f"Saved to {output.name}")
-        QMessageBox.information(self, "Audiobook ready", f"Created:\n{output}")
+    def book_conversion_finished(self, book_id: str, output: str) -> None:
+        book = next((item for item in self.books if item.book_id == book_id), None)
+        title = book.display_title if book else Path(output).stem
+        self.status_label.setText(f"Saved {title} to {output}")
 
-    def conversion_failed(self, message: str) -> None:
-        self.progress.setValue(0)
-        self.status_label.setText("Export failed")
-        QMessageBox.critical(self, "Could not export", message)
+    def conversion_finished(self, outputs: list) -> None:
+        self.progress.setValue(100)
+        self.status_label.setText(f"Saved {len(outputs)} audiobook{'' if len(outputs) == 1 else 's'}")
+        QMessageBox.information(self, "Audiobooks ready", f"Created {len(outputs)} audiobook{'' if len(outputs) == 1 else 's'} in:\n{self.output_edit.text()}")
 
-    def conversion_cancelled(self) -> None:
+    def conversion_failed(self, message: str, completed: int) -> None:
         self.progress.setValue(0)
-        self.status_label.setText("Export cancelled")
+        self.status_label.setText(f"Export stopped after {completed} completed book{'' if completed == 1 else 's'}")
+        QMessageBox.critical(self, "Could not export batch", message)
+
+    def conversion_cancelled(self, completed: int) -> None:
+        self.progress.setValue(0)
+        self.status_label.setText(f"Export cancelled after {completed} completed book{'' if completed == 1 else 's'}")
 
 
 STYLESHEET = """
@@ -797,9 +1201,9 @@ QMainWindow, #root { background: #151719; }
 #intro { color: #aaa9a3; font-size: 19px; }
 QGroupBox { border: 1px solid #343936; border-radius: 8px; margin-top: 12px; padding: 18px; font-weight: 700; color: #d7ff5f; letter-spacing: 1px; }
 QGroupBox::title { subcontrol-origin: margin; left: 16px; padding: 0 6px; }
-QListWidget { border: 1px dashed #4c5549; border-radius: 6px; background: #1b1e1c; padding: 8px; }
-QListWidget::item { padding: 10px 8px; border-radius: 4px; color: #d4d5cd; }
-QListWidget::item:selected { background: #344126; color: #f3ffd4; }
+QListWidget, QTreeWidget { border: 1px dashed #4c5549; border-radius: 6px; background: #1b1e1c; padding: 8px; }
+QListWidget::item, QTreeWidget::item { padding: 8px; border-radius: 4px; color: #d4d5cd; }
+QListWidget::item:selected, QTreeWidget::item:selected { background: #344126; color: #f3ffd4; }
 QLineEdit { background: #202321; border: 1px solid #414840; border-radius: 4px; padding: 10px; selection-background-color: #718d2c; }
 QLineEdit:focus { border: 1px solid #a7cf44; }
 QPushButton { background: #2a302b; border: 1px solid #4a5449; border-radius: 4px; padding: 10px 14px; font-weight: 600; }

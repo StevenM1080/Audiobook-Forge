@@ -179,3 +179,63 @@ def test_track_number_sort_places_untagged_chapters_last(
     window.sort_combo.setCurrentIndex(1)
 
     assert [chapter.track_number for chapter in window.chapters] == [1, 2, None]
+
+
+def test_folder_import_creates_collapsible_books_and_switches_metadata(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    first_folder = tmp_path / "First Book"
+    second_folder = tmp_path / "Second Book"
+    first_folder.mkdir()
+    second_folder.mkdir()
+    for folder in (first_folder, second_folder):
+        (folder / "01.mp3").write_bytes(b"audio")
+    monkeypatch.setattr(module, "probe_audio", lambda path: Chapter(path.resolve(), path.stem, 1.0))
+    monkeypatch.setattr(module, "common_tags", lambda _chapters: {})
+
+    window.add_paths([first_folder, second_folder])
+
+    assert len(window.books) == 2
+    assert window.file_tree.topLevelItemCount() == 2
+    first_item = window.file_tree.topLevelItem(0)
+    second_item = window.file_tree.topLevelItem(1)
+    assert first_item.text(0) == "First Book"
+    assert first_item.childCount() == 1
+    first_item.setExpanded(True)
+    first_item.child(0).setText(1, "Edited chapter")
+    app.processEvents()
+    assert window.books[0].chapters[0].title == "Edited chapter"
+    first_item.setExpanded(False)
+    assert not first_item.isExpanded()
+
+    window.file_tree.setCurrentItem(first_item)
+    app.processEvents()
+    window.author_edit.setText("Author One")
+    window.title_edit.setText("Edited First")
+    window.file_tree.setCurrentItem(second_item)
+    app.processEvents()
+
+    assert window.books[0].metadata.title == "Edited First"
+    assert window.books[0].metadata.author == "Author One"
+    assert window.title_edit.text() == "Second Book"
+    window.close()
+
+
+def test_loose_files_added_together_form_one_book(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    files = [tmp_path / "01.mp3", tmp_path / "02.mp3"]
+    for path in files:
+        path.write_bytes(b"audio")
+    monkeypatch.setattr(module, "probe_audio", lambda path: Chapter(path.resolve(), path.stem, 1.0))
+    monkeypatch.setattr(module, "common_tags", lambda _chapters: {})
+
+    window.add_paths(files)
+
+    assert len(window.books) == 1
+    assert [chapter.path for chapter in window.books[0].chapters] == [path.resolve() for path in files]
+    window.close()
