@@ -9,7 +9,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtGui import QDragEnterEvent
-from PySide6.QtWidgets import QApplication, QListWidgetItem, QMainWindow
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QHeaderView, QListWidgetItem, QMainWindow
 
 from audiobook_forge.models import Chapter
 
@@ -82,6 +83,8 @@ def test_layout_uses_content_minimums_instead_of_a_fixed_window_size(
     app.processEvents()
 
     assert window.output_edit.minimumWidth() >= 180
+    for index in range(3):
+        assert window.file_tree.header().sectionResizeMode(index) == QHeaderView.ResizeMode.Interactive
     assert window.details_group.width() >= 390
     assert window.output_edit.width() >= window.output_edit.minimumWidth()
     assert window.details_group.height() >= window.details_group.minimumSizeHint().height()
@@ -102,6 +105,21 @@ def test_window_geometry_preference_is_ignored(
 
     assert not settings.contains("window_geometry")
     assert window.width() > 120 or window.height() > 120
+    window.close()
+
+
+def test_window_opens_centered_on_available_screen(
+    app: QApplication, tmp_path: Path
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    window.show()
+    app.processEvents()
+    QTest.qWait(150)
+    app.processEvents()
+    available = app.primaryScreen().availableGeometry()
+
+    assert window.frameGeometry().center() == available.center()
     window.close()
 
 
@@ -201,7 +219,9 @@ def test_folder_import_creates_collapsible_books_and_switches_metadata(
     assert window.file_tree.topLevelItemCount() == 2
     first_item = window.file_tree.topLevelItem(0)
     second_item = window.file_tree.topLevelItem(1)
-    assert first_item.text(0) == "First Book"
+    assert first_item.text(0) == ""
+    assert first_item.text(1) == "First Book"
+    assert first_item.text(2) == "00:00:01"
     assert first_item.childCount() == 1
     first_item.setExpanded(True)
     first_item.child(0).setText(1, "Edited chapter")
@@ -214,12 +234,38 @@ def test_folder_import_creates_collapsible_books_and_switches_metadata(
     app.processEvents()
     window.author_edit.setText("Author One")
     window.title_edit.setText("Edited First")
+    window.metadata_edits["series_number"].setText("3")
+    assert first_item.text(0) == "3"
     window.file_tree.setCurrentItem(second_item)
     app.processEvents()
 
     assert window.books[0].metadata.title == "Edited First"
     assert window.books[0].metadata.author == "Author One"
     assert window.title_edit.text() == "Second Book"
+    window.close()
+
+
+def test_numbered_folder_populates_series_number_without_number_in_title(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    source_folder = tmp_path / "1 Among The Hidden"
+    source_folder.mkdir()
+    chapter = source_folder / "01.mp3"
+    chapter.write_bytes(b"audio")
+    monkeypatch.setattr(module, "probe_audio", lambda path: Chapter(path.resolve(), path.stem, 1.0))
+    monkeypatch.setattr(module, "common_tags", lambda _chapters: {})
+
+    window.add_paths([source_folder])
+
+    book = window.books[0]
+    assert book.metadata.series_number == "1"
+    assert book.metadata.title == "Among The Hidden"
+    assert window.metadata_edits["series_number"].text() == "1"
+    assert window.title_edit.text() == "Among The Hidden"
+    assert window.file_tree.topLevelItem(0).text(0) == "1"
+    assert window.file_tree.topLevelItem(0).text(1) == "Among The Hidden"
     window.close()
 
 
@@ -238,4 +284,24 @@ def test_loose_files_added_together_form_one_book(
 
     assert len(window.books) == 1
     assert [chapter.path for chapter in window.books[0].chapters] == [path.resolve() for path in files]
+    window.close()
+
+
+def test_folder_cover_is_autopopulated_without_missing_cover_warning(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    source_folder = tmp_path / "Book"
+    source_folder.mkdir()
+    (source_folder / "01.mp3").write_bytes(b"audio")
+    cover = source_folder / "Cover.png"
+    cover.write_bytes(b"image")
+    monkeypatch.setattr(module, "probe_audio", lambda path: Chapter(path.resolve(), path.stem, 1.0))
+    monkeypatch.setattr(module, "common_tags", lambda _chapters: {})
+
+    window.add_paths([source_folder])
+
+    assert window.books[0].cover == cover.resolve()
+    assert window.cover_drop.path == cover.resolve()
     window.close()

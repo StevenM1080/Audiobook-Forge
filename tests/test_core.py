@@ -7,6 +7,7 @@ from audiobook_forge.models import (
     estimate_output_bytes,
     natural_sort_key,
     safe_output_stem,
+    split_leading_series_number,
 )
 
 
@@ -17,6 +18,12 @@ def test_natural_sort_key_orders_numbers_numerically() -> None:
         "Chapter 2.mp3",
         "Chapter 10.mp3",
     ]
+
+
+def test_split_leading_series_number_from_folder_title() -> None:
+    assert split_leading_series_number("1 Among The Hidden") == ("1", "Among The Hidden")
+    assert split_leading_series_number("02 - The Next Book") == ("02", "The Next Book")
+    assert split_leading_series_number("A Book") == ("", "A Book")
 
 
 def test_metadata_escaping() -> None:

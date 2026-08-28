@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from audiobook_forge import media
-from audiobook_forge.media import common_tags, probe_audio, supported_audio_files
+from audiobook_forge.media import common_tags, find_cover, probe_audio, supported_audio_files
 from audiobook_forge.models import Chapter
 
 
@@ -67,3 +67,21 @@ def test_common_tags_falls_back_cleanly_when_a_file_changes(
     monkeypatch.setattr(media, "File", moved)
 
     assert common_tags([Chapter(Path("missing.mp3"), "Missing", 1.0)]) == {}
+
+
+def test_find_cover_prefers_cover_named_image_in_input_folder(tmp_path: Path) -> None:
+    (tmp_path / "art.png").write_bytes(b"image")
+    cover = tmp_path / "Cover.jpg"
+    cover.write_bytes(b"image")
+
+    assert find_cover(tmp_path) == cover.resolve()
+
+
+def test_find_cover_supports_a_cover_subfolder_and_missing_is_empty(tmp_path: Path) -> None:
+    cover_folder = tmp_path / "Cover"
+    cover_folder.mkdir()
+    cover = cover_folder / "front.webp"
+    cover.write_bytes(b"image")
+
+    assert find_cover(tmp_path) == cover.resolve()
+    assert find_cover(tmp_path / "missing") is None

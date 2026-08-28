@@ -8,6 +8,9 @@ from mutagen import File
 from .models import Chapter, SUPPORTED_AUDIO_EXTENSIONS
 
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
 def probe_audio(path: Path) -> Chapter:
     try:
         audio = File(path, easy=True)
@@ -46,6 +49,50 @@ def common_tags(chapters: list[Chapter]) -> dict[str, str]:
 
 def supported_audio_files(folder: Path) -> list[Path]:
     return [path for path in folder.iterdir() if path.is_file() and path.suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS]
+
+
+def find_cover(folder: Path) -> Path | None:
+    """Find a conventional Cover image without treating absence as an error."""
+
+    if not folder.is_dir():
+        return None
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return None
+
+    direct_matches = sorted(
+        (
+            path
+            for path in entries
+            if path.is_file()
+            and path.suffix.casefold() in IMAGE_EXTENSIONS
+            and path.stem.casefold() == "cover"
+        ),
+        key=lambda path: path.name.casefold(),
+    )
+    if direct_matches:
+        return direct_matches[0].resolve()
+
+    cover_directories = sorted(
+        (path for path in entries if path.is_dir() and path.name.casefold() == "cover"),
+        key=lambda path: path.name.casefold(),
+    )
+    for cover_directory in cover_directories:
+        try:
+            images = sorted(
+                (
+                    path
+                    for path in cover_directory.iterdir()
+                    if path.is_file() and path.suffix.casefold() in IMAGE_EXTENSIONS
+                ),
+                key=lambda path: (path.stem.casefold() != "cover", path.name.casefold()),
+            )
+        except OSError:
+            continue
+        if images:
+            return images[0].resolve()
+    return None
 
 
 def _first_tag(tags: object, key: str) -> str:

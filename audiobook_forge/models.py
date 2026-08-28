@@ -47,6 +47,15 @@ class Book:
         return self.metadata.title.strip() or self.source_name.strip() or "Untitled book"
 
 
+def split_leading_series_number(value: str) -> tuple[str, str]:
+    """Split a leading folder number from its title when both are present."""
+
+    match = re.match(r"^\s*(\d+)(?:\s*[-_.:)]\s*|\s+)(\S.*)\s*$", value)
+    if not match:
+        return "", value.strip()
+    return match.group(1), match.group(2).strip()
+
+
 def natural_sort_key(path: Path) -> list[object]:
     parts: list[object] = []
     for part in re.split(r"(\d+)", path.name.casefold()):

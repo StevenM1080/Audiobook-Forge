@@ -4,7 +4,7 @@ import shutil
 from copy import deepcopy
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSettings, QThread, Qt, Signal
+from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -36,7 +37,7 @@ from audiobook_forge.exporter import (
     format_time,
     metadata_value,
 )
-from audiobook_forge.media import common_tags, probe_audio, supported_audio_files
+from audiobook_forge.media import IMAGE_EXTENSIONS, common_tags, find_cover, probe_audio, supported_audio_files
 from audiobook_forge.models import (
     BookMetadata,
     Book,
@@ -45,13 +46,11 @@ from audiobook_forge.models import (
     estimate_output_bytes,
     book_output_path,
     natural_sort_key,
+    split_leading_series_number,
 )
 from audiobook_forge.project_io import load_project, save_batch_project
 
 AUDIO_EXTENSIONS = SUPPORTED_AUDIO_EXTENSIONS
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-
-
 class DropList(QListWidget):
     paths_dropped = Signal(list)
 
@@ -92,6 +91,9 @@ class DropList(QListWidget):
 
 
 BOOK_ROLE = Qt.ItemDataRole.UserRole
+NUMBER_COLUMN = 0
+TITLE_COLUMN = 1
+DURATION_COLUMN = 2
 CHAPTER_PATH_ROLE = Qt.ItemDataRole.UserRole + 1
 CHAPTER_TITLE_ROLE = Qt.ItemDataRole.UserRole + 2
 CHAPTER_DURATION_ROLE = Qt.ItemDataRole.UserRole + 3
@@ -107,12 +109,20 @@ class DropTree(QTreeWidget):
         self.setDragDropMode(QTreeWidget.DragDropMode.InternalMove)
         self.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.setColumnCount(3)
-        self.setHeaderHidden(True)
+        self.setHeaderLabels(["#", "Title", "Duration"])
+        self.setHeaderHidden(False)
+        header = self.header()
+        header.setSectionsMovable(False)
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(NUMBER_COLUMN, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(TITLE_COLUMN, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(DURATION_COLUMN, QHeaderView.ResizeMode.Interactive)
         self.setIndentation(18)
         self.setAlternatingRowColors(False)
         self.setUniformRowHeights(True)
-        self.setColumnWidth(0, 36)
-        self.setColumnWidth(2, 84)
+        self.setColumnWidth(NUMBER_COLUMN, 56)
+        self.setColumnWidth(TITLE_COLUMN, 380)
+        self.setColumnWidth(DURATION_COLUMN, 100)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
@@ -315,6 +325,24 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_menu()
         self._restore_settings()
+
+    def _center_on_screen(self) -> None:
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        if not self.isMaximized() and not self.isFullScreen():
+            self.adjustSize()
+        available = screen.availableGeometry()
+        frame = self.frameGeometry()
+        frame.moveCenter(available.center())
+        self.move(frame.topLeft())
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self._center_on_screen)
+        # Qt may apply the final platform frame size after the first queued
+        # callback. Recenter once that post-show sizing pass has completed.
+        QTimer.singleShot(100, self._center_on_screen)
 
     @property
     def chapters(self) -> list[Chapter]:
@@ -602,22 +630,37 @@ class MainWindow(QMainWindow):
     def _book_from_import(self, chapters: list[Chapter], source: Path | None) -> Book:
         tags = common_tags(chapters)
         source_name = source.name if source else self._loose_group_name(chapters)
+        folder_series_number, folder_title = split_leading_series_number(source.name) if source else ("", "")
+        tagged_title = tags.get("album", "").strip()
+        title = tagged_title or folder_title or source_name
+        if folder_series_number:
+            _, title_without_number = split_leading_series_number(title)
+            if title_without_number != title:
+                title = title_without_number
+        cover_source = source or self._common_parent(chapters)
         metadata = BookMetadata(
-            title=tags.get("album", "") or source_name,
+            title=title,
             author=tags.get("albumartist", "") or tags.get("artist", ""),
             narrator=tags.get("composer", ""),
+            series_number=folder_series_number,
             year=tags.get("date", ""),
             genre=tags.get("genre", ""),
         )
         book = Book(
             chapters=chapters,
             metadata=metadata,
+            cover=find_cover(cover_source) if cover_source else None,
             bitrate=self._default_bitrate(),
             channel_mode=self._default_channel_mode(),
             source_name=source_name,
         )
         self._sort_book(book)
         return book
+
+    @staticmethod
+    def _common_parent(chapters: list[Chapter]) -> Path | None:
+        parents = {chapter.path.parent for chapter in chapters}
+        return next(iter(parents)) if len(parents) == 1 else None
 
     @staticmethod
     def _loose_group_name(chapters: list[Chapter]) -> str:
@@ -689,19 +732,26 @@ class MainWindow(QMainWindow):
         selected_item: QTreeWidgetItem | None = None
         for book in self.books:
             book_item = QTreeWidgetItem()
-            book_item.setText(0, book.display_title)
+            book_item.setText(NUMBER_COLUMN, book.metadata.series_number.strip())
+            book_item.setText(TITLE_COLUMN, book.display_title)
+            book_item.setText(DURATION_COLUMN, self._format_time(sum(chapter.duration for chapter in book.chapters)))
             book_item.setData(0, BOOK_ROLE, book.book_id)
-            book_item.setFirstColumnSpanned(True)
             book_item.setFlags(book_item.flags() | Qt.ItemFlag.ItemIsDropEnabled)
+            book_font = book_item.font(0)
+            book_font.setBold(True)
+            book_item.setFont(0, book_font)
+            book_item.setFont(NUMBER_COLUMN, book_font)
+            book_item.setFont(TITLE_COLUMN, book_font)
+            book_item.setFont(DURATION_COLUMN, book_font)
             self.file_tree.addTopLevelItem(book_item)
             for index, chapter in enumerate(book.chapters, start=1):
                 chapter_item = QTreeWidgetItem(book_item)
-                chapter_item.setText(0, f"{index:02d}")
-                chapter_item.setText(1, chapter.title)
-                chapter_item.setText(2, self._format_time(chapter.duration))
-                chapter_item.setData(1, CHAPTER_PATH_ROLE, str(chapter.path))
-                chapter_item.setData(1, CHAPTER_TITLE_ROLE, chapter.title)
-                chapter_item.setData(1, CHAPTER_DURATION_ROLE, chapter.duration)
+                chapter_item.setText(NUMBER_COLUMN, f"{index:02d}")
+                chapter_item.setText(TITLE_COLUMN, chapter.title)
+                chapter_item.setText(DURATION_COLUMN, self._format_time(chapter.duration))
+                chapter_item.setData(TITLE_COLUMN, CHAPTER_PATH_ROLE, str(chapter.path))
+                chapter_item.setData(TITLE_COLUMN, CHAPTER_TITLE_ROLE, chapter.title)
+                chapter_item.setData(TITLE_COLUMN, CHAPTER_DURATION_ROLE, chapter.duration)
                 chapter_item.setFlags(chapter_item.flags() | Qt.ItemFlag.ItemIsEditable)
             book_item.setExpanded(book.book_id in expanded)
             if book.book_id == target_id:
@@ -742,11 +792,11 @@ class MainWindow(QMainWindow):
             ordered_chapters: list[Chapter] = []
             for child_index in range(book_item.childCount()):
                 child = book_item.child(child_index)
-                path = Path(str(child.data(1, CHAPTER_PATH_ROLE)))
+                path = Path(str(child.data(TITLE_COLUMN, CHAPTER_PATH_ROLE)))
                 chapter = chapters_by_path.get(path)
                 if chapter is None:
                     continue
-                chapter.title = str(child.data(1, CHAPTER_TITLE_ROLE) or child.text(1)).strip()
+                chapter.title = str(child.data(TITLE_COLUMN, CHAPTER_TITLE_ROLE) or child.text(TITLE_COLUMN)).strip()
                 ordered_chapters.append(chapter)
             book.chapters = ordered_chapters
             ordered.append(book)
@@ -754,10 +804,10 @@ class MainWindow(QMainWindow):
         self._refresh_count()
 
     def _tree_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
-        if self._loading_book or item.parent() is None or column != 1:
+        if self._loading_book or item.parent() is None or column != TITLE_COLUMN:
             return
         previous = self.file_tree.blockSignals(True)
-        item.setData(1, CHAPTER_TITLE_ROLE, item.text(1).strip())
+        item.setData(TITLE_COLUMN, CHAPTER_TITLE_ROLE, item.text(TITLE_COLUMN).strip())
         self.file_tree.blockSignals(previous)
         self._sync_tree()
 
@@ -771,7 +821,7 @@ class MainWindow(QMainWindow):
         self._tree_structure_changed()
 
     def _chapter_title_changed(self, item: QListWidgetItem) -> None:
-        self._tree_item_changed(item, 1)
+        self._tree_item_changed(item, TITLE_COLUMN)
 
     def apply_sort(self, index: int) -> None:
         self._commit_current_book()
@@ -878,7 +928,8 @@ class MainWindow(QMainWindow):
             item = self.file_tree.topLevelItem(index)
             if item.data(0, BOOK_ROLE) == book.book_id:
                 self.file_tree.blockSignals(True)
-                item.setText(0, book.display_title)
+                item.setText(NUMBER_COLUMN, book.metadata.series_number.strip())
+                item.setText(TITLE_COLUMN, book.display_title)
                 self.file_tree.blockSignals(False)
                 return
 
@@ -1202,6 +1253,7 @@ QMainWindow, #root { background: #151719; }
 QGroupBox { border: 1px solid #343936; border-radius: 8px; margin-top: 12px; padding: 18px; font-weight: 700; color: #d7ff5f; letter-spacing: 1px; }
 QGroupBox::title { subcontrol-origin: margin; left: 16px; padding: 0 6px; }
 QListWidget, QTreeWidget { border: 1px dashed #4c5549; border-radius: 6px; background: #1b1e1c; padding: 8px; }
+QHeaderView::section { background: #202621; color: #9da49a; border: none; border-bottom: 1px solid #343936; padding: 6px 8px; }
 QListWidget::item, QTreeWidget::item { padding: 8px; border-radius: 4px; color: #d4d5cd; }
 QListWidget::item:selected, QTreeWidget::item:selected { background: #344126; color: #f3ffd4; }
 QLineEdit { background: #202321; border: 1px solid #414840; border-radius: 4px; padding: 10px; selection-background-color: #718d2c; }
