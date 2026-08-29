@@ -41,6 +41,9 @@ class Book:
     channel_mode: str = "Auto"
     source_name: str = ""
     book_id: str = field(default_factory=lambda: uuid4().hex)
+    # Cached result of the content-based Auto channel analysis. This is kept
+    # out of project files because it must be recomputed when sources change.
+    auto_channel_count: int | None = None
 
     @property
     def display_title(self) -> str:

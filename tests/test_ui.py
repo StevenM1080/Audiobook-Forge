@@ -169,6 +169,55 @@ def test_channel_mode_replaces_preserve_source_with_auto(
     window.close()
 
 
+def test_auto_channel_label_reflects_resolved_layout_without_changing_mode(
+    app: QApplication, tmp_path: Path
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    window.chapters = [Chapter(tmp_path / "01.mp3", "Chapter", 1.0)]
+    window._render_chapters()
+    book_id = window.books[0].book_id
+
+    window._channel_mode_resolved(book_id, 1)
+    assert window.channel_combo.itemText(0) == "Auto (mono)"
+    assert window.channel_combo.currentData() == "Auto"
+    window._commit_current_book()
+    assert window.books[0].channel_mode == "Auto"
+
+    window._channel_mode_resolved(book_id, 2)
+    assert window.channel_combo.itemText(0) == "Auto (stereo)"
+    window.close()
+
+
+def test_import_resolves_auto_channel_layout_before_export(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    source = tmp_path / "Chapter 1.mp3"
+    source.write_bytes(b"audio")
+    monkeypatch.setattr(
+        module,
+        "probe_audio",
+        lambda path: Chapter(path.resolve(), "Chapter", 1.0, channels=2),
+    )
+    monkeypatch.setattr(module, "common_tags", lambda _chapters: {})
+    monkeypatch.setattr(module, "discover_tool", lambda *_args, **_kwargs: Path("ffmpeg"))
+    monkeypatch.setattr(
+        module,
+        "target_channel_count",
+        lambda chapters, mode, **_kwargs: 1 if mode == "Auto" and chapters else 2,
+    )
+
+    window.add_paths([source])
+
+    assert window.books[0].auto_channel_count == 1
+    assert window._auto_channel_results[window.books[0].book_id] == 1
+    assert window.channel_combo.itemText(0) == "Auto (mono)"
+    assert window.channel_combo.currentData() == "Auto"
+    window.close()
+
+
 def test_filename_title_source_applies_to_new_imports(
     app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -35,8 +35,10 @@ from audiobook_forge.exporter import (
     BatchExportEngine,
     ExportCancelled,
     ExportEngine,
+    discover_tool,
     format_time,
     metadata_value,
+    target_channel_count,
 )
 from audiobook_forge.media import IMAGE_EXTENSIONS, common_tags, find_cover, probe_audio, supported_audio_files
 from audiobook_forge.models import (
@@ -307,6 +309,7 @@ class ConversionWorker(QObject):
 class BatchConversionWorker(QObject):
     progress = Signal(int, str)
     book_finished = Signal(str, str)
+    channel_mode_resolved = Signal(str, int)
     finished = Signal(list)
     failed = Signal(str, int)
     cancelled = Signal(int)
@@ -320,6 +323,7 @@ class BatchConversionWorker(QObject):
             ffprobe_path,
             self.progress.emit,
             lambda _index, book, output: self.book_finished.emit(book.book_id, str(output)),
+            lambda _index, book, channels: self.channel_mode_resolved.emit(book.book_id, channels),
         )
 
     def cancel(self) -> None:
@@ -346,6 +350,7 @@ class MainWindow(QMainWindow):
         self._pending_cover: Path | None = None
         self._embedded_chapter_titles: dict[Path, str] = {}
         self._use_filename_titles = False
+        self._auto_channel_results: dict[str, int] = {}
         self._loading_book = False
         self._legacy_chapters_assignment = False
         self.thread: QThread | None = None
@@ -385,11 +390,13 @@ class MainWindow(QMainWindow):
 
     @chapters.setter
     def chapters(self, chapters: list[Chapter]) -> None:
+        self._auto_channel_results.clear()
         if not self.books:
             self.books = [Book(chapters=list(chapters), source_name="Imported book")]
             self.selected_book_id = self.books[0].book_id
         elif len(self.books) == 1:
             self.books[0].chapters = list(chapters)
+            self.books[0].auto_channel_count = None
         else:
             self.books = [Book(chapters=list(chapters), source_name="Imported book")]
             self.selected_book_id = self.books[0].book_id
@@ -417,9 +424,8 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             bitrate_index = 1
         self.quality_combo.setCurrentIndex(bitrate_index if bitrate_index in range(4) else 1)
-        self.channel_combo.setCurrentText(
-            self._normalize_channel_mode(self.settings.value("channel_mode", "Auto"))
-        )
+        channel_mode = self._normalize_channel_mode(self.settings.value("channel_mode", "Auto"))
+        self.channel_combo.setCurrentIndex(self.channel_combo.findData(channel_mode))
         try:
             title_source = int(self.settings.value("chapter_title_source", CHAPTER_TITLE_SOURCE_EMBEDDED))
         except (TypeError, ValueError):
@@ -575,7 +581,9 @@ class MainWindow(QMainWindow):
         self.quality_combo.currentIndexChanged.connect(self._book_settings_changed)
         details.addWidget(QLabel("Channels"), 11, 0)
         self.channel_combo = QComboBox()
-        self.channel_combo.addItems(["Auto", "Force mono", "Force stereo"])
+        self.channel_combo.addItem("Auto", "Auto")
+        self.channel_combo.addItem("Force mono", "Force mono")
+        self.channel_combo.addItem("Force stereo", "Force stereo")
         details.addWidget(self.channel_combo, 11, 1)
         self.channel_combo.currentTextChanged.connect(self._book_settings_changed)
         details.setColumnStretch(1, 1)
@@ -673,8 +681,10 @@ class MainWindow(QMainWindow):
             if legacy_target is not None:
                 legacy_target.chapters.extend(imported)
                 self._sort_book(legacy_target)
+                self._resolve_auto_channels(legacy_target)
                 continue
             book = self._book_from_import(imported, source)
+            self._resolve_auto_channels(book)
             new_books.append(book)
 
         self._legacy_chapters_assignment = False
@@ -733,6 +743,20 @@ class MainWindow(QMainWindow):
     def _default_channel_mode(self) -> str:
         return self._normalize_channel_mode(self.settings.value("channel_mode", "Auto"))
 
+    def _resolve_auto_channels(self, book: Book) -> None:
+        """Resolve and cache Auto's channel choice while importing the book."""
+
+        ffmpeg = discover_tool(
+            "ffmpeg",
+            self.settings.value("ffmpeg_path", "") or None,
+        )
+        book.auto_channel_count = target_channel_count(
+            book.chapters,
+            "Auto",
+            ffmpeg=ffmpeg,
+        )
+        self._auto_channel_results[book.book_id] = book.auto_channel_count
+
     @staticmethod
     def _normalize_channel_mode(value: object) -> str:
         mode = str(value)
@@ -773,6 +797,7 @@ class MainWindow(QMainWindow):
         self.selected_book_id = None
         self._pending_cover = None
         self._embedded_chapter_titles.clear()
+        self._auto_channel_results.clear()
         self.file_tree.clear()
         self._clear_form()
         self._refresh_count()
@@ -800,6 +825,9 @@ class MainWindow(QMainWindow):
             if book.chapters:
                 remaining.append(book)
         self.books = remaining
+        for book in self.books:
+            book.auto_channel_count = None
+        self._auto_channel_results.clear()
         self.selected_book_id = self.books[0].book_id if self.books else None
         self._render_books(self.selected_book_id)
 
@@ -968,7 +996,11 @@ class MainWindow(QMainWindow):
             if book.cover:
                 self.cover_drop.set_path(book.cover)
             self.quality_combo.setCurrentIndex({64: 0, 96: 1, 128: 2, 160: 3}.get(book.bitrate, 1))
-            self.channel_combo.setCurrentText(book.channel_mode)
+            self._update_auto_channel_label(
+                self._auto_channel_results.get(book.book_id, book.auto_channel_count)
+            )
+            channel_mode = self._normalize_channel_mode(book.channel_mode)
+            self.channel_combo.setCurrentIndex(self.channel_combo.findData(channel_mode))
         finally:
             self._loading_book = False
         self._refresh_output_preview()
@@ -980,7 +1012,8 @@ class MainWindow(QMainWindow):
                 edit.clear()
             self.cover_drop.clear()
             self.quality_combo.setCurrentIndex(1)
-            self.channel_combo.setCurrentText("Auto")
+            self._update_auto_channel_label(None)
+            self.channel_combo.setCurrentIndex(self.channel_combo.findData("Auto"))
         finally:
             self._loading_book = False
         self._refresh_output_preview()
@@ -1000,7 +1033,7 @@ class MainWindow(QMainWindow):
         )
         book.cover = self.cover_drop.path.resolve() if self.cover_drop.path else None
         book.bitrate = [64, 96, 128, 160][self.quality_combo.currentIndex()]
-        book.channel_mode = self.channel_combo.currentText()
+        book.channel_mode = self._normalize_channel_mode(self.channel_combo.currentData())
 
     def _book_form_changed(self, *_args) -> None:
         if self._loading_book:
@@ -1012,6 +1045,26 @@ class MainWindow(QMainWindow):
 
     def _book_settings_changed(self, *_args) -> None:
         self._book_form_changed()
+
+    def _update_auto_channel_label(self, channels: int | None) -> None:
+        label = {
+            1: "Auto (mono)",
+            2: "Auto (stereo)",
+        }.get(channels, "Auto")
+        previous = self.channel_combo.blockSignals(True)
+        self.channel_combo.setItemText(0, label)
+        self.channel_combo.blockSignals(previous)
+
+    def _channel_mode_resolved(self, book_id: str, channels: int) -> None:
+        if channels not in {1, 2}:
+            return
+        self._auto_channel_results[book_id] = channels
+        for book in self.books:
+            if book.book_id == book_id:
+                book.auto_channel_count = channels
+                break
+        if book_id == self.selected_book_id:
+            self._update_auto_channel_label(channels)
 
     def _update_book_item(self) -> None:
         book = self._selected_book()
@@ -1177,6 +1230,7 @@ class MainWindow(QMainWindow):
 
         self.books = loaded_books
         self._embedded_chapter_titles.clear()
+        self._auto_channel_results.clear()
         for book in self.books:
             for chapter in book.chapters:
                 self._remember_chapter_title(chapter)
@@ -1277,6 +1331,7 @@ class MainWindow(QMainWindow):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self.update_progress)
+        worker.channel_mode_resolved.connect(self._channel_mode_resolved)
         worker.book_finished.connect(self.book_conversion_finished)
         worker.finished.connect(self.conversion_finished)
         worker.failed.connect(self.conversion_failed)

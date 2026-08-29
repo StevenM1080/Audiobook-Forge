@@ -20,6 +20,7 @@ from .models import Book, BookMetadata, Chapter, book_output_path
 
 ProgressCallback = Callable[[int, str], None]
 BookFinishedCallback = Callable[[int, Book, Path], None]
+ChannelModeResolvedCallback = Callable[[int], None]
 
 AUTO_STEREO_SAMPLE_SECONDS = 20
 AUTO_STEREO_SAMPLE_RATE = 16000
@@ -105,6 +106,7 @@ def target_channel_count(
     channel_mode: str,
     *,
     ffmpeg: Path | None = None,
+    auto_channel_count: int | None = None,
     should_cancel: Callable[[], None] | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> int:
@@ -113,6 +115,8 @@ def target_channel_count(
     if channel_mode == "Force stereo":
         return 2
     if channel_mode == "Auto":
+        if auto_channel_count in {1, 2}:
+            return auto_channel_count
         candidates = [chapter for chapter in chapters if chapter.channels != 1]
         if not candidates:
             return 1
@@ -497,6 +501,8 @@ class ExportEngine:
         ffmpeg_path: str | None,
         ffprobe_path: str | None,
         progress: ProgressCallback | None = None,
+        channel_mode_resolved: ChannelModeResolvedCallback | None = None,
+        auto_channel_count: int | None = None,
     ) -> None:
         self.chapters = tuple(chapters)
         self.output = output
@@ -507,6 +513,8 @@ class ExportEngine:
         self.ffmpeg_path = ffmpeg_path
         self.ffprobe_path = ffprobe_path
         self.progress = progress or (lambda _value, _message: None)
+        self.channel_mode_resolved = channel_mode_resolved
+        self.auto_channel_count = auto_channel_count
         self._cancel_event = threading.Event()
         self._process_lock = threading.Lock()
         self._process: subprocess.Popen[str] | None = None
@@ -540,12 +548,15 @@ class ExportEngine:
             self.chapters,
             self.channel_mode,
             ffmpeg=ffmpeg,
+            auto_channel_count=self.auto_channel_count,
             should_cancel=self._raise_if_cancelled,
             progress=lambda completed, total: self.progress(
                 2 + int(2 * completed / total) if total else 2,
                 "Analyzing channel content",
             ),
         )
+        if self.channel_mode == "Auto" and self.channel_mode_resolved:
+            self.channel_mode_resolved(channels)
         sample_rate = target_sample_rate(self.chapters)
 
         with tempfile.TemporaryDirectory(
@@ -737,6 +748,7 @@ class BatchExportEngine:
         ffprobe_path: str | None,
         progress: ProgressCallback | None = None,
         book_finished: BookFinishedCallback | None = None,
+        channel_mode_resolved: Callable[[int, Book, int], None] | None = None,
     ) -> None:
         self.books = tuple(books)
         self.destination_root = destination_root
@@ -744,6 +756,7 @@ class BatchExportEngine:
         self.ffprobe_path = ffprobe_path
         self.progress = progress or (lambda _value, _message: None)
         self.book_finished = book_finished or (lambda _index, _book, _output: None)
+        self.channel_mode_resolved = channel_mode_resolved
         self.completed: list[Path] = []
         self._cancel_event = threading.Event()
         self._current_engine: ExportEngine | None = None
@@ -782,6 +795,14 @@ class BatchExportEngine:
                 self.ffmpeg_path,
                 self.ffprobe_path,
                 book_progress,
+                channel_mode_resolved=(
+                    lambda channels, book_index=index, current_book=book: self.channel_mode_resolved(
+                        book_index, current_book, channels
+                    )
+                    if self.channel_mode_resolved
+                    else None
+                ),
+                auto_channel_count=book.auto_channel_count,
             )
             self._current_engine = engine
             try:

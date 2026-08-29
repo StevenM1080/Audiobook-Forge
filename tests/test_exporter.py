@@ -310,6 +310,27 @@ def test_auto_channel_mode_uses_content_analysis_for_stereo_inputs(
     assert target_channel_count([centered, meaningful], "Auto", ffmpeg=Path("ffmpeg")) == 2
 
 
+def test_cached_auto_channel_count_skips_content_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chapter = Chapter(Path("chapter.mp3"), "Chapter", 1.0, channels=2)
+
+    def should_not_analyze(*_args, **_kwargs):
+        raise AssertionError("Auto analysis should not run for a cached result")
+
+    monkeypatch.setattr(exporter, "detect_meaningful_stereo", should_not_analyze)
+
+    assert (
+        target_channel_count(
+            [chapter],
+            "Auto",
+            ffmpeg=Path("ffmpeg"),
+            auto_channel_count=1,
+        )
+        == 1
+    )
+
+
 def test_sample_rate_is_preserved_or_normalized_to_a_standard_rate() -> None:
     low = Chapter(Path("low.mp3"), "Low", 1.0, sample_rate=22050)
     cd = Chapter(Path("cd.mp3"), "CD", 1.0, sample_rate=44100)
