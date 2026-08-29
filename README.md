@@ -1,6 +1,6 @@
 # Audiobook Forge
 
-A PySide6 desktop app for authoring a chapterized M4B audiobook from MP3, M4A, AAC, FLAC, WAV, or OGG files.
+A PySide6 desktop app for recompiling a chapterized M4B audiobook from MP3, M4A, AAC, FLAC, WAV, or OGG files. No more large books having hundreds of single-chapter audio files to manage.
 
 ## Run
 
