@@ -38,7 +38,7 @@ class Book:
     metadata: BookMetadata = field(default_factory=BookMetadata)
     cover: Path | None = None
     bitrate: int = 96
-    channel_mode: str = "Preserve source"
+    channel_mode: str = "Auto"
     source_name: str = ""
     book_id: str = field(default_factory=lambda: uuid4().hex)
 

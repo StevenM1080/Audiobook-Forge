@@ -10,7 +10,7 @@ import pytest
 from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtGui import QDragEnterEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QHeaderView, QListWidgetItem, QMainWindow
+from PySide6.QtWidgets import QApplication, QHeaderView, QLineEdit, QListWidgetItem, QMainWindow
 
 from audiobook_forge.models import Chapter
 
@@ -83,12 +83,110 @@ def test_layout_uses_content_minimums_instead_of_a_fixed_window_size(
     app.processEvents()
 
     assert window.output_edit.minimumWidth() >= 180
+    header = window.file_tree.header()
     for index in range(3):
-        assert window.file_tree.header().sectionResizeMode(index) == QHeaderView.ResizeMode.Interactive
+        assert header.sectionResizeMode(index) == QHeaderView.ResizeMode.Interactive
+    assert header.stretchLastSection()
+    assert header.length() == header.viewport().width()
+    assert header.sectionSize(module.DURATION_COLUMN) > 100
     assert window.details_group.width() >= 390
     assert window.output_edit.width() >= window.output_edit.minimumWidth()
     assert window.details_group.height() >= window.details_group.minimumSizeHint().height()
     assert window.chapter_group.width() >= window.chapter_group.minimumSizeHint().width()
+    window.close()
+
+
+def test_number_header_aligns_with_indented_chapter_numbers(
+    app: QApplication, tmp_path: Path
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    window.chapters = [Chapter(tmp_path / "01.mp3", "Opening", 1.0)]
+    window._render_chapters()
+
+    number_alignment = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+    assert window.file_tree.headerItem().textAlignment(module.NUMBER_COLUMN) == number_alignment
+    assert window.file_tree.topLevelItem(0).textAlignment(module.NUMBER_COLUMN) == number_alignment
+    assert window.file_tree.columnWidth(module.NUMBER_COLUMN) >= (
+        window.file_tree.indentation()
+        + 16
+        + window.file_tree.fontMetrics().horizontalAdvance("00")
+    )
+    window.close()
+
+
+def test_chapter_title_editor_uses_the_full_row_height(
+    app: QApplication, tmp_path: Path
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    window.chapters = [Chapter(tmp_path / "01.mp3", "Opening", 1.0)]
+    window._render_chapters()
+    book_item = window.file_tree.topLevelItem(0)
+    book_item.setExpanded(True)
+    app.processEvents()
+    chapter_item = book_item.child(0)
+
+    window.file_tree.editItem(chapter_item, module.TITLE_COLUMN)
+    app.processEvents()
+    editor = window.file_tree.findChildren(QLineEdit)[0]
+
+    assert editor.height() == window.file_tree.visualItemRect(chapter_item).height()
+    assert editor.height() >= editor.fontMetrics().height() + 2
+    window.close()
+
+
+def test_chapter_title_source_can_switch_between_embedded_title_and_filename(
+    app: QApplication, tmp_path: Path
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    chapter_path = tmp_path / "Chapter 1 - Preface.mp3"
+    window.chapters = [Chapter(chapter_path, "- 01/16", 1.0)]
+    window._render_chapters()
+
+    window.chapter_title_combo.setCurrentIndex(module.CHAPTER_TITLE_SOURCE_FILENAME)
+    assert window.chapters[0].title == "Chapter 1 - Preface"
+    assert window.file_tree.topLevelItem(0).child(0).text(module.TITLE_COLUMN) == "Chapter 1 - Preface"
+
+    window.chapter_title_combo.setCurrentIndex(module.CHAPTER_TITLE_SOURCE_EMBEDDED)
+    assert window.chapters[0].title == "- 01/16"
+    window.close()
+
+
+def test_channel_mode_replaces_preserve_source_with_auto(
+    app: QApplication, tmp_path: Path
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+
+    assert [window.channel_combo.itemText(index) for index in range(window.channel_combo.count())] == [
+        "Auto",
+        "Force mono",
+        "Force stereo",
+    ]
+    assert window._default_channel_mode() == "Auto"
+    window.close()
+
+
+def test_filename_title_source_applies_to_new_imports(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    source = tmp_path / "Chapter 2 - The Selish System.mp3"
+    source.write_bytes(b"audio")
+    monkeypatch.setattr(
+        module,
+        "probe_audio",
+        lambda path: Chapter(path.resolve(), "- 02/16", 1.0),
+    )
+    monkeypatch.setattr(module, "common_tags", lambda _chapters: {})
+    window.chapter_title_combo.setCurrentIndex(module.CHAPTER_TITLE_SOURCE_FILENAME)
+
+    window.add_paths([source])
+
+    assert window.books[0].chapters[0].title == "Chapter 2 - The Selish System"
     window.close()
 
 

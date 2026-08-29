@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from audiobook_forge.exporter import (
     ExportEngine,
     build_mux_command,
     build_normalize_command,
+    detect_meaningful_stereo,
     discover_tool,
     target_channel_count,
     target_sample_rate,
@@ -274,6 +276,38 @@ def test_preserve_source_selects_one_consistent_channel_layout() -> None:
     stereo = Chapter(Path("stereo.mp3"), "Stereo", 1.0, channels=2)
     assert target_channel_count([mono], "Preserve source") == 1
     assert target_channel_count([mono, stereo], "Preserve source") == 2
+
+
+def test_auto_detects_centered_and_meaningful_stereo_samples(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    centered = b"".join(struct.pack("<hh", 10000, 10000) for _ in range(256))
+    stereo = b"".join(struct.pack("<hh", 10000, -10000) for _ in range(256))
+    samples = iter([centered, stereo])
+
+    def fake_run(*_args, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout=next(samples), stderr=b"")
+
+    monkeypatch.setattr(exporter.subprocess, "run", fake_run)
+    source = tmp_path / "sample.mp3"
+
+    assert detect_meaningful_stereo(source, Path("ffmpeg")) is False
+    assert detect_meaningful_stereo(source, Path("ffmpeg")) is True
+
+
+def test_auto_channel_mode_uses_content_analysis_for_stereo_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    centered = Chapter(Path("centered.mp3"), "Centered", 1.0, channels=2)
+    meaningful = Chapter(Path("meaningful.mp3"), "Meaningful", 1.0, channels=2)
+    monkeypatch.setattr(
+        exporter,
+        "detect_meaningful_stereo",
+        lambda source, _ffmpeg, **_kwargs: source.name == "meaningful.mp3",
+    )
+
+    assert target_channel_count([centered], "Auto", ffmpeg=Path("ffmpeg")) == 1
+    assert target_channel_count([centered, meaningful], "Auto", ffmpeg=Path("ffmpeg")) == 2
 
 
 def test_sample_rate_is_preserved_or_normalized_to_a_standard_rate() -> None:

@@ -20,7 +20,9 @@ A PySide6 desktop app for recompiling a chapterized M4B audiobook from MP3, M4A,
 
 Python 3.10 or newer is required.
 
-Drop audiobook folders or groups of audio files into the book tree. Each folder is one book, and files selected in one action form one book. Expand or collapse books, drag chapters within a book for manual order, double-click chapter titles to edit them, select books to edit their metadata, choose per-book quality/channel settings, choose one batch destination folder, and export all books. Projects can be saved as JSON from the **Project** menu.
+Drop audiobook folders or groups of audio files into the book tree. Each folder is one book, and files selected in one action form one book. Expand or collapse books, drag chapters within a book for manual order, double-click chapter titles to edit them, select books to edit their metadata, choose whether chapter titles come from embedded tags or source file names, choose per-book quality/channel settings, choose one batch destination folder, and export all books. Projects can be saved as JSON from the **Project** menu.
+
+Channel mode offers **Auto**, **Force mono**, and **Force stereo**. Auto samples each stereo source and downmixes the book to mono when the channels are effectively identical; bitrate remains an independent quality setting. Older projects using **Preserve source** are migrated to Auto when opened.
 
 When importing a book folder, Audiobook Forge automatically uses a supported image in that folder as the pre-loaded cover. Conventional names such as `Cover.*`, `folder.*`, or `front.*` are preferred when multiple images are present; images inside a `Cover` subfolder are also supported. If none is present, the cover field simply remains empty and can be filled manually.
 

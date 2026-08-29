@@ -135,7 +135,8 @@ def _validate_legacy_payload(payload: dict) -> None:
             raise ValueError(f"The project has an invalid {key} path.")
     if payload.get("bitrate", 96) not in {64, 96, 128, 160}:
         raise ValueError("The project has an unsupported bitrate.")
-    if payload.get("channel_mode", "Preserve source") not in {
+    if payload.get("channel_mode", "Auto") not in {
+        "Auto",
         "Preserve source",
         "Force mono",
         "Force stereo",
@@ -163,7 +164,8 @@ def _validate_batch_payload(payload: dict) -> None:
             raise ValueError(f"Book {index} has an invalid cover path.")
         if book.get("bitrate", 96) not in {64, 96, 128, 160}:
             raise ValueError(f"Book {index} has an unsupported bitrate.")
-        if book.get("channel_mode", "Preserve source") not in {
+        if book.get("channel_mode", "Auto") not in {
+            "Auto",
             "Preserve source",
             "Force mono",
             "Force stereo",

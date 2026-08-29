@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QComboBox,
+    QStyledItemDelegate,
     QSplitter,
     QTreeWidget,
     QTreeWidgetItem,
@@ -90,10 +91,30 @@ class DropList(QListWidget):
             super().dropEvent(event)
 
 
+class TreeTitleDelegate(QStyledItemDelegate):
+    """Keep the inline title editor inside the complete tree row."""
+
+    def updateEditorGeometry(self, editor, option, index) -> None:
+        row_rect = None
+        view = self.parent()
+        if isinstance(view, QTreeWidget):
+            candidate = view.visualRect(index)
+            if candidate.isValid():
+                row_rect = candidate
+
+        editor_rect = option.rect
+        if row_rect is not None:
+            editor_rect.setTop(row_rect.top())
+            editor_rect.setBottom(row_rect.bottom())
+        editor.setGeometry(editor_rect)
+
+
 BOOK_ROLE = Qt.ItemDataRole.UserRole
 NUMBER_COLUMN = 0
 TITLE_COLUMN = 1
 DURATION_COLUMN = 2
+CHAPTER_TITLE_SOURCE_EMBEDDED = 0
+CHAPTER_TITLE_SOURCE_FILENAME = 1
 CHAPTER_PATH_ROLE = Qt.ItemDataRole.UserRole + 1
 CHAPTER_TITLE_ROLE = Qt.ItemDataRole.UserRole + 2
 CHAPTER_DURATION_ROLE = Qt.ItemDataRole.UserRole + 3
@@ -113,14 +134,22 @@ class DropTree(QTreeWidget):
         self.setHeaderHidden(False)
         header = self.header()
         header.setSectionsMovable(False)
-        header.setStretchLastSection(False)
+        header.setStretchLastSection(True)
         header.setSectionResizeMode(NUMBER_COLUMN, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(TITLE_COLUMN, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(DURATION_COLUMN, QHeaderView.ResizeMode.Interactive)
         self.setIndentation(18)
         self.setAlternatingRowColors(False)
         self.setUniformRowHeights(True)
-        self.setColumnWidth(NUMBER_COLUMN, 56)
+        # The tree branch and the chapter number share the first section. Give
+        # the number enough room after the branch indent and align it with the
+        # matching header edge so the expand control does not look like '#'.
+        header_item = self.headerItem()
+        header_item.setTextAlignment(
+            NUMBER_COLUMN,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
+        self.setColumnWidth(NUMBER_COLUMN, 76)
         self.setColumnWidth(TITLE_COLUMN, 380)
         self.setColumnWidth(DURATION_COLUMN, 100)
 
@@ -315,6 +344,8 @@ class MainWindow(QMainWindow):
         self.selected_book_id: str | None = None
         self.destination_root: Path | None = None
         self._pending_cover: Path | None = None
+        self._embedded_chapter_titles: dict[Path, str] = {}
+        self._use_filename_titles = False
         self._loading_book = False
         self._legacy_chapters_assignment = False
         self.thread: QThread | None = None
@@ -386,7 +417,19 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             bitrate_index = 1
         self.quality_combo.setCurrentIndex(bitrate_index if bitrate_index in range(4) else 1)
-        self.channel_combo.setCurrentText(self.settings.value("channel_mode", "Preserve source"))
+        self.channel_combo.setCurrentText(
+            self._normalize_channel_mode(self.settings.value("channel_mode", "Auto"))
+        )
+        try:
+            title_source = int(self.settings.value("chapter_title_source", CHAPTER_TITLE_SOURCE_EMBEDDED))
+        except (TypeError, ValueError):
+            title_source = CHAPTER_TITLE_SOURCE_EMBEDDED
+        if title_source not in {CHAPTER_TITLE_SOURCE_EMBEDDED, CHAPTER_TITLE_SOURCE_FILENAME}:
+            title_source = CHAPTER_TITLE_SOURCE_EMBEDDED
+        self._use_filename_titles = title_source == CHAPTER_TITLE_SOURCE_FILENAME
+        self.chapter_title_combo.blockSignals(True)
+        self.chapter_title_combo.setCurrentIndex(title_source)
+        self.chapter_title_combo.blockSignals(False)
 
     def _build_menu(self) -> None:
         project_menu = self.menuBar().addMenu("Project")
@@ -436,6 +479,7 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(self.chapter_group)
         self.file_tree = DropTree()
         self.file_list = self.file_tree
+        self.file_tree.setItemDelegateForColumn(TITLE_COLUMN, TreeTitleDelegate(self.file_tree))
         self.file_tree.paths_dropped.connect(self.add_paths)
         self.file_tree.itemChanged.connect(self._tree_item_changed)
         self.file_tree.itemSelectionChanged.connect(self._tree_selection_changed)
@@ -457,6 +501,15 @@ class MainWindow(QMainWindow):
         row.addWidget(add_button)
         row.addWidget(folder_button)
         row.addWidget(remove_button)
+        row.addWidget(QLabel("Titles:"))
+        self.chapter_title_combo = QComboBox()
+        self.chapter_title_combo.addItem("Embedded title", CHAPTER_TITLE_SOURCE_EMBEDDED)
+        self.chapter_title_combo.addItem("File name", CHAPTER_TITLE_SOURCE_FILENAME)
+        self.chapter_title_combo.setToolTip(
+            "Choose whether chapter titles come from embedded audio tags or source file names."
+        )
+        self.chapter_title_combo.currentIndexChanged.connect(self._chapter_title_source_changed)
+        row.addWidget(self.chapter_title_combo)
         row.addWidget(QLabel("Sort:"))
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(["Natural filename", "Track number", "Manual order"])
@@ -522,7 +575,7 @@ class MainWindow(QMainWindow):
         self.quality_combo.currentIndexChanged.connect(self._book_settings_changed)
         details.addWidget(QLabel("Channels"), 11, 0)
         self.channel_combo = QComboBox()
-        self.channel_combo.addItems(["Preserve source", "Force mono", "Force stereo"])
+        self.channel_combo.addItems(["Auto", "Force mono", "Force stereo"])
         details.addWidget(self.channel_combo, 11, 1)
         self.channel_combo.currentTextChanged.connect(self._book_settings_changed)
         details.setColumnStretch(1, 1)
@@ -606,6 +659,7 @@ class MainWindow(QMainWindow):
                 except ValueError as error:
                     QMessageBox.warning(self, "Could not read audio", str(error))
                     continue
+                self._remember_chapter_title(chapter)
                 imported.append(chapter)
                 existing.add(resolved_path)
             if not imported:
@@ -677,8 +731,14 @@ class MainWindow(QMainWindow):
         return [64, 96, 128, 160][index if index in range(4) else 1]
 
     def _default_channel_mode(self) -> str:
-        value = self.settings.value("channel_mode", "Preserve source")
-        return value if value in {"Preserve source", "Force mono", "Force stereo"} else "Preserve source"
+        return self._normalize_channel_mode(self.settings.value("channel_mode", "Auto"))
+
+    @staticmethod
+    def _normalize_channel_mode(value: object) -> str:
+        mode = str(value)
+        if mode == "Preserve source":
+            return "Auto"
+        return mode if mode in {"Auto", "Force mono", "Force stereo"} else "Auto"
 
     def _sort_book(self, book: Book) -> None:
         if self.sort_combo.currentIndex() == 0:
@@ -686,10 +746,33 @@ class MainWindow(QMainWindow):
         elif self.sort_combo.currentIndex() == 1:
             book.chapters.sort(key=lambda chapter: (chapter.track_number is None, chapter.track_number or 0, natural_sort_key(chapter.path)))
 
+    def _remember_chapter_title(self, chapter: Chapter) -> None:
+        self._embedded_chapter_titles.setdefault(chapter.path, chapter.title)
+        if self._use_filename_titles:
+            chapter.title = chapter.path.stem
+
+    def _chapter_title_source_changed(self, index: int) -> None:
+        use_filename_titles = index == CHAPTER_TITLE_SOURCE_FILENAME
+        if use_filename_titles == self._use_filename_titles:
+            return
+        self._commit_current_book()
+        self._sync_tree()
+        self._use_filename_titles = use_filename_titles
+        for book in self.books:
+            for chapter in book.chapters:
+                if use_filename_titles:
+                    self._embedded_chapter_titles.setdefault(chapter.path, chapter.title)
+                    chapter.title = chapter.path.stem
+                else:
+                    chapter.title = self._embedded_chapter_titles.get(chapter.path, chapter.title)
+        self.settings.setValue("chapter_title_source", index)
+        self._render_books(self.selected_book_id)
+
     def clear_files(self) -> None:
         self.books.clear()
         self.selected_book_id = None
         self._pending_cover = None
+        self._embedded_chapter_titles.clear()
         self.file_tree.clear()
         self._clear_form()
         self._refresh_count()
@@ -735,6 +818,10 @@ class MainWindow(QMainWindow):
             book_item.setText(NUMBER_COLUMN, book.metadata.series_number.strip())
             book_item.setText(TITLE_COLUMN, book.display_title)
             book_item.setText(DURATION_COLUMN, self._format_time(sum(chapter.duration for chapter in book.chapters)))
+            book_item.setTextAlignment(
+                NUMBER_COLUMN,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
             book_item.setData(0, BOOK_ROLE, book.book_id)
             book_item.setFlags(book_item.flags() | Qt.ItemFlag.ItemIsDropEnabled)
             book_font = book_item.font(0)
@@ -749,6 +836,10 @@ class MainWindow(QMainWindow):
                 chapter_item.setText(NUMBER_COLUMN, f"{index:02d}")
                 chapter_item.setText(TITLE_COLUMN, chapter.title)
                 chapter_item.setText(DURATION_COLUMN, self._format_time(chapter.duration))
+                chapter_item.setTextAlignment(
+                    NUMBER_COLUMN,
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                )
                 chapter_item.setData(TITLE_COLUMN, CHAPTER_PATH_ROLE, str(chapter.path))
                 chapter_item.setData(TITLE_COLUMN, CHAPTER_TITLE_ROLE, chapter.title)
                 chapter_item.setData(TITLE_COLUMN, CHAPTER_DURATION_ROLE, chapter.duration)
@@ -797,6 +888,8 @@ class MainWindow(QMainWindow):
                 if chapter is None:
                     continue
                 chapter.title = str(child.data(TITLE_COLUMN, CHAPTER_TITLE_ROLE) or child.text(TITLE_COLUMN)).strip()
+                if not self._use_filename_titles:
+                    self._embedded_chapter_titles[chapter.path] = chapter.title
                 ordered_chapters.append(chapter)
             book.chapters = ordered_chapters
             ordered.append(book)
@@ -887,7 +980,7 @@ class MainWindow(QMainWindow):
                 edit.clear()
             self.cover_drop.clear()
             self.quality_combo.setCurrentIndex(1)
-            self.channel_combo.setCurrentText("Preserve source")
+            self.channel_combo.setCurrentText("Auto")
         finally:
             self._loading_book = False
         self._refresh_output_preview()
@@ -1048,7 +1141,7 @@ class MainWindow(QMainWindow):
                         metadata=legacy_metadata,
                         cover=legacy_cover,
                         bitrate=payload.get("bitrate", 96),
-                        channel_mode=payload.get("channel_mode", "Preserve source"),
+                        channel_mode=self._normalize_channel_mode(payload.get("channel_mode", "Auto")),
                         source_name=source_name,
                     )
                 ]
@@ -1072,7 +1165,7 @@ class MainWindow(QMainWindow):
                             ),
                             cover=project_file(item["cover"]) if item.get("cover") else None,
                             bitrate=item.get("bitrate", 96),
-                            channel_mode=item.get("channel_mode", "Preserve source"),
+                            channel_mode=self._normalize_channel_mode(item.get("channel_mode", "Auto")),
                             source_name=item.get("source_name", ""),
                             book_id=item.get("id") or Book().book_id,
                         )
@@ -1083,6 +1176,10 @@ class MainWindow(QMainWindow):
             return
 
         self.books = loaded_books
+        self._embedded_chapter_titles.clear()
+        for book in self.books:
+            for chapter in book.chapters:
+                self._remember_chapter_title(chapter)
         self.selected_book_id = self.books[0].book_id if self.books else None
         self.destination_root = loaded_destination
         self.output_edit.setText(str(loaded_destination) if loaded_destination else "")
@@ -1222,6 +1319,10 @@ class MainWindow(QMainWindow):
             return
         self.settings.setValue("bitrate_index", self.quality_combo.currentIndex())
         self.settings.setValue("channel_mode", self.channel_combo.currentText())
+        self.settings.setValue(
+            "chapter_title_source",
+            CHAPTER_TITLE_SOURCE_FILENAME if self._use_filename_titles else CHAPTER_TITLE_SOURCE_EMBEDDED,
+        )
         event.accept()
 
     def book_conversion_finished(self, book_id: str, output: str) -> None:
@@ -1257,6 +1358,7 @@ QHeaderView::section { background: #202621; color: #9da49a; border: none; border
 QListWidget::item, QTreeWidget::item { padding: 8px; border-radius: 4px; color: #d4d5cd; }
 QListWidget::item:selected, QTreeWidget::item:selected { background: #344126; color: #f3ffd4; }
 QLineEdit { background: #202321; border: 1px solid #414840; border-radius: 4px; padding: 10px; selection-background-color: #718d2c; }
+QTreeWidget QLineEdit { padding: 0 6px; }
 QLineEdit:focus { border: 1px solid #a7cf44; }
 QPushButton { background: #2a302b; border: 1px solid #4a5449; border-radius: 4px; padding: 10px 14px; font-weight: 600; }
 QPushButton:hover { background: #374234; border-color: #a7cf44; }

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+from array import array
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
@@ -18,6 +20,10 @@ from .models import Book, BookMetadata, Chapter, book_output_path
 
 ProgressCallback = Callable[[int, str], None]
 BookFinishedCallback = Callable[[int, Book, Path], None]
+
+AUTO_STEREO_SAMPLE_SECONDS = 20
+AUTO_STEREO_SAMPLE_RATE = 16000
+AUTO_STEREO_DIFFERENCE_THRESHOLD = 0.05
 
 
 class ExportCancelled(Exception):
@@ -94,15 +100,122 @@ def discover_tool(
     return None
 
 
-def target_channel_count(chapters: Sequence[Chapter], channel_mode: str) -> int:
+def target_channel_count(
+    chapters: Sequence[Chapter],
+    channel_mode: str,
+    *,
+    ffmpeg: Path | None = None,
+    should_cancel: Callable[[], None] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+) -> int:
     if channel_mode == "Force mono":
         return 1
     if channel_mode == "Force stereo":
         return 2
+    if channel_mode == "Auto":
+        candidates = [chapter for chapter in chapters if chapter.channels != 1]
+        if not candidates:
+            return 1
+        if ffmpeg is None:
+            return 2
+        for index, chapter in enumerate(candidates, start=1):
+            if should_cancel:
+                should_cancel()
+            if progress:
+                progress(index - 1, len(candidates))
+            if chapter.channels and chapter.channels > 2:
+                return 2
+            stereo = detect_meaningful_stereo(
+                chapter.path,
+                ffmpeg,
+                should_cancel=should_cancel,
+            )
+            if stereo is None or stereo:
+                return 2
+        if progress:
+            progress(len(candidates), len(candidates))
+        return 1
+    # Keep the old mode readable for projects created before Auto existed.
     known_channels = [chapter.channels for chapter in chapters if chapter.channels]
     if known_channels and all(channels == 1 for channels in known_channels):
         return 1
     return 2
+
+
+def detect_meaningful_stereo(
+    source: Path,
+    ffmpeg: Path,
+    *,
+    should_cancel: Callable[[], None] | None = None,
+) -> bool | None:
+    """Return whether a short decoded sample contains meaningful stereo.
+
+    ``None`` means the sample could not be analyzed. Callers should treat that
+    as stereo so Auto remains conservative when a source or decoder is faulty.
+    """
+
+    command = [
+        str(ffmpeg),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        str(source),
+        "-map",
+        "0:a:0",
+        "-t",
+        str(AUTO_STEREO_SAMPLE_SECONDS),
+        "-vn",
+        "-sn",
+        "-dn",
+        "-ac",
+        "2",
+        "-ar",
+        str(AUTO_STEREO_SAMPLE_RATE),
+        "-f",
+        "s16le",
+        "pipe:1",
+    ]
+    if should_cancel:
+        should_cancel()
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=AUTO_STEREO_SAMPLE_SECONDS + 10,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if should_cancel:
+        should_cancel()
+    if result.returncode != 0:
+        return None
+
+    raw = result.stdout
+    frame_bytes = 4
+    if len(raw) < frame_bytes:
+        return None
+    samples = array("h")
+    samples.frombytes(raw[: len(raw) - len(raw) % frame_bytes])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if len(samples) < 2:
+        return None
+
+    total_energy = 0.0
+    difference_energy = 0.0
+    for left, right in zip(samples[0::2], samples[1::2]):
+        total_energy += float(left * left + right * right)
+        difference = left - right
+        difference_energy += float(difference * difference)
+    if total_energy <= 0:
+        return False
+
+    normalized_difference = math.sqrt(difference_energy / (2 * total_energy))
+    return normalized_difference >= AUTO_STEREO_DIFFERENCE_THRESHOLD
 
 
 def target_sample_rate(chapters: Sequence[Chapter]) -> int:
@@ -422,9 +535,18 @@ class ExportEngine:
         self.output.parent.mkdir(parents=True, exist_ok=True)
         total_source_duration = sum(chapter.duration for chapter in self.chapters)
         total_label = format_time(total_source_duration)
-        channels = target_channel_count(self.chapters, self.channel_mode)
-        sample_rate = target_sample_rate(self.chapters)
         self.progress(2, "Preparing export")
+        channels = target_channel_count(
+            self.chapters,
+            self.channel_mode,
+            ffmpeg=ffmpeg,
+            should_cancel=self._raise_if_cancelled,
+            progress=lambda completed, total: self.progress(
+                2 + int(2 * completed / total) if total else 2,
+                "Analyzing channel content",
+            ),
+        )
+        sample_rate = target_sample_rate(self.chapters)
 
         with tempfile.TemporaryDirectory(
             prefix=".audiobook-forge-", dir=self.output.parent
@@ -527,7 +649,7 @@ class ExportEngine:
             raise ValueError(f"Output folder does not exist: {self.output.parent}")
         if self.bitrate not in {64, 96, 128, 160}:
             raise ValueError(f"Unsupported bitrate: {self.bitrate} kbps")
-        if self.channel_mode not in {"Preserve source", "Force mono", "Force stereo"}:
+        if self.channel_mode not in {"Auto", "Preserve source", "Force mono", "Force stereo"}:
             raise ValueError(f"Unsupported channel mode: {self.channel_mode}")
 
     def _run_process(
