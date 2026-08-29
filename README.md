@@ -22,7 +22,7 @@ Python 3.10 or newer is required.
 
 Drop audiobook folders or groups of audio files into the book tree. Each folder is one book, and files selected in one action form one book. Expand or collapse books, drag chapters within a book for manual order, double-click chapter titles to edit them, select books to edit their metadata, choose per-book quality/channel settings, choose one batch destination folder, and export all books. Projects can be saved as JSON from the **Project** menu.
 
-When importing a book folder, Audiobook Forge automatically looks for `Cover.jpg`, `Cover.jpeg`, `Cover.png`, or `Cover.webp`, as well as images inside a `Cover` subfolder. If none is present, the cover field simply remains empty and can be filled manually.
+When importing a book folder, Audiobook Forge automatically uses a supported image in that folder as the pre-loaded cover. Conventional names such as `Cover.*`, `folder.*`, or `front.*` are preferred when multiple images are present; images inside a `Cover` subfolder are also supported. If none is present, the cover field simply remains empty and can be filled manually.
 
 Batch output is organized as `Destination\Author\[Series]\[Series Number - ]Title\Title.m4b`. Existing author and series folders are reused. Books are exported sequentially and committed after validation; cancelling or failing a later book preserves all earlier completed books and stops the remaining queue.
 
@@ -38,5 +38,15 @@ Install the development requirements and run the suite:
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
+
+## Build a Windows executable
+
+Run the build script manually from PowerShell:
+
+```powershell
+.\build.ps1
+```
+
+It creates `dist\AudiobookForge.exe` and does not launch it. The script is not connected to the test suite or any automatic build hook. For exporting, place `ffmpeg.exe` and `ffprobe.exe` beside the executable, or configure them from the **Tools** menu.
 
 When FFmpeg is available, the suite includes a short generated MP3/WAV-to-M4B export with cover and metadata verification.

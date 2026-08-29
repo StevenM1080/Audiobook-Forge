@@ -52,7 +52,14 @@ def supported_audio_files(folder: Path) -> list[Path]:
 
 
 def find_cover(folder: Path) -> Path | None:
-    """Find a conventional Cover image without treating absence as an error."""
+    """Find the most likely cover image in a book folder.
+
+    Book folders commonly contain artwork with names such as ``Cover.jpg``
+    or ``folder.jpg``, but there is no reliable requirement that the image be
+    named that way.  Prefer conventional names when there are multiple
+    candidates, then fall back to the first supported image in deterministic
+    filename order.
+    """
 
     if not folder.is_dir():
         return None
@@ -61,18 +68,16 @@ def find_cover(folder: Path) -> Path | None:
     except OSError:
         return None
 
-    direct_matches = sorted(
+    direct_images = sorted(
         (
             path
             for path in entries
-            if path.is_file()
-            and path.suffix.casefold() in IMAGE_EXTENSIONS
-            and path.stem.casefold() == "cover"
+            if path.is_file() and path.suffix.casefold() in IMAGE_EXTENSIONS
         ),
-        key=lambda path: path.name.casefold(),
+        key=lambda path: (_cover_name_priority(path), path.name.casefold()),
     )
-    if direct_matches:
-        return direct_matches[0].resolve()
+    if direct_images:
+        return direct_images[0].resolve()
 
     cover_directories = sorted(
         (path for path in entries if path.is_dir() and path.name.casefold() == "cover"),
@@ -93,6 +98,18 @@ def find_cover(folder: Path) -> Path | None:
         if images:
             return images[0].resolve()
     return None
+
+
+def _cover_name_priority(path: Path) -> int:
+    """Return a stable preference for common cover-art filenames."""
+
+    return {
+        "cover": 0,
+        "folder": 1,
+        "front": 2,
+        "frontcover": 2,
+        "front-cover": 2,
+    }.get(path.stem.casefold(), 3)
 
 
 def _first_tag(tags: object, key: str) -> str:

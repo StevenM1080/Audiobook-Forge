@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 .pytest_cache/
 *.m4b
+build/
+dist/
+*.spec

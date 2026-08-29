@@ -77,6 +77,13 @@ def test_find_cover_prefers_cover_named_image_in_input_folder(tmp_path: Path) ->
     assert find_cover(tmp_path) == cover.resolve()
 
 
+def test_find_cover_falls_back_to_an_arbitrarily_named_image(tmp_path: Path) -> None:
+    artwork = tmp_path / "My Book Artwork.png"
+    artwork.write_bytes(b"image")
+
+    assert find_cover(tmp_path) == artwork.resolve()
+
+
 def test_find_cover_supports_a_cover_subfolder_and_missing_is_empty(tmp_path: Path) -> None:
     cover_folder = tmp_path / "Cover"
     cover_folder.mkdir()
