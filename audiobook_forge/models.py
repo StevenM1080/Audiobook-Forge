@@ -28,6 +28,13 @@ class BookMetadata:
     series_number: str = ""
     year: str = ""
     genre: str = ""
+    subtitle: str = ""
+    publisher: str = ""
+    description: str = ""
+    isbn: str = ""
+    language: str = ""
+    tags: str = ""
+    rating: str = ""
 
 
 @dataclass

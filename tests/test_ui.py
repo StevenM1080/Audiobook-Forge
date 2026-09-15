@@ -452,3 +452,62 @@ def test_folder_cover_is_autopopulated_without_missing_cover_warning(
     assert window.books[0].cover == cover.resolve()
     assert window.cover_drop.path == cover.resolve()
     window.close()
+
+
+def test_metadata_search_applies_result_and_downloaded_cover(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    source = tmp_path / "01.mp3"
+    source.write_bytes(b"audio")
+    window.chapters = [Chapter(source, "Imported title", 60.0)]
+    window._render_chapters()
+    cover = tmp_path / "downloaded-cover.jpg"
+    cover.write_bytes(b"image")
+
+    result = module.MetadataResult(
+        title="Matched title",
+        subtitle="A subtitle",
+        author="Matched author",
+        narrator="Matched narrator",
+        publisher="Matched publisher",
+        published_year="2024",
+        description="A description",
+        cover_url="https://example.test/cover.jpg",
+        isbn="9780000000000",
+        genres=("Fantasy",),
+        tags=("Magic",),
+        series_name="A series",
+        series_number="2",
+        language="English",
+        rating="4.5",
+        source="Google Books",
+        source_id="google:test",
+    )
+
+    class FakeDialog:
+        selected_result = result
+
+        def __init__(self, *_args) -> None:
+            pass
+
+        def exec(self):
+            return module.QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(module, "MetadataSearchDialog", FakeDialog)
+    monkeypatch.setattr(module, "download_cover", lambda *_args: cover)
+
+    window.search_metadata()
+
+    metadata = window.books[0].metadata
+    assert metadata.title == "Matched title"
+    assert metadata.author == "Matched author"
+    assert metadata.narrator == "Matched narrator"
+    assert metadata.series == "A series"
+    assert metadata.series_number == "2"
+    assert metadata.genre == "Fantasy"
+    assert metadata.description == "A description"
+    assert metadata.isbn == "9780000000000"
+    assert window.books[0].cover == cover
+    window.close()

@@ -8,8 +8,11 @@ from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
+    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHeaderView,
@@ -52,6 +55,7 @@ from audiobook_forge.models import (
     split_leading_series_number,
 )
 from audiobook_forge.project_io import load_project, save_batch_project
+from audiobook_forge.metadata import MetadataFinder, MetadataLookupError, MetadataResult, download_cover
 
 AUDIO_EXTENSIONS = SUPPORTED_AUDIO_EXTENSIONS
 class DropList(QListWidget):
@@ -340,6 +344,173 @@ class BatchConversionWorker(QObject):
             self.finished.emit([str(output) for output in outputs])
 
 
+class MetadataSearchWorker(QObject):
+    results = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        title: str,
+        author: str,
+        isbn: str,
+    ) -> None:
+        super().__init__()
+        self.title = title
+        self.author = author
+        self.isbn = isbn
+
+    def run(self) -> None:
+        try:
+            results = MetadataFinder().search(self.title, self.author, self.isbn)
+        except Exception as error:
+            self.failed.emit(str(error))
+        else:
+            self.results.emit(results)
+
+
+class MetadataSearchDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget | None,
+        title: str,
+        author: str,
+        isbn: str,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Search audiobook metadata")
+        self.resize(720, 560)
+        self.selected_result: MetadataResult | None = None
+        self._search_thread: QThread | None = None
+        self._search_worker: MetadataSearchWorker | None = None
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.title_edit = QLineEdit(title)
+        self.author_edit = QLineEdit(author)
+        self.isbn_edit = QLineEdit(isbn)
+        self.isbn_edit.setPlaceholderText("Optional ISBN; exact lookup")
+        form.addRow("Title", self.title_edit)
+        form.addRow("Author", self.author_edit)
+        form.addRow("ISBN", self.isbn_edit)
+        layout.addLayout(form)
+
+        search_row = QHBoxLayout()
+        self.search_button = QPushButton("Search books")
+        self.search_button.clicked.connect(self.search)
+        search_row.addWidget(self.search_button)
+        self.search_status = QLabel("Search Google Books and Open Library by title and author, or enter an ISBN.")
+        self.search_status.setObjectName("hint")
+        search_row.addWidget(self.search_status, 1)
+        layout.addLayout(search_row)
+
+        self.results_list = QListWidget()
+        self.results_list.itemDoubleClicked.connect(self._apply_selected)
+        self.results_list.currentItemChanged.connect(self._result_selection_changed)
+        layout.addWidget(self.results_list, 1)
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Apply
+        )
+        self.apply_button = self.button_box.button(QDialogButtonBox.StandardButton.Apply)
+        self.apply_button.setText("Apply selected")
+        self.apply_button.setEnabled(False)
+        self.button_box.rejected.connect(self.reject)
+        self.button_box.accepted.connect(self._apply_selected)
+        layout.addWidget(self.button_box)
+
+    def search(self) -> None:
+        title = self.title_edit.text().strip()
+        isbn = self.isbn_edit.text().strip()
+        if not title and not isbn:
+            self.search_status.setText("Enter a title or ISBN first.")
+            return
+        if self._search_thread and self._search_thread.isRunning():
+            return
+
+        self.results_list.clear()
+        self.apply_button.setEnabled(False)
+        self.search_button.setEnabled(False)
+        self.button_box.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(False)
+        self.search_status.setText("Searching Google Books and Open Library…")
+        thread = QThread(self)
+        worker = MetadataSearchWorker(
+            title,
+            self.author_edit.text().strip(),
+            isbn,
+        )
+        self._search_thread = thread
+        self._search_worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.results.connect(self._show_results)
+        worker.failed.connect(self._show_search_error)
+        worker.results.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._search_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _show_results(self, results: list[MetadataResult]) -> None:
+        self.results_list.clear()
+        for result in results:
+            item = QListWidgetItem(self._result_text(result))
+            item.setData(Qt.ItemDataRole.UserRole, result)
+            self.results_list.addItem(item)
+        if results:
+            self.results_list.setCurrentRow(0)
+            self.search_status.setText(f"Found {len(results)} result(s). Select one to apply.")
+        else:
+            self.search_status.setText("No book matches found. Try a shorter title or check the author.")
+        self.search_button.setEnabled(True)
+        self.button_box.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(True)
+
+    def _show_search_error(self, message: str) -> None:
+        self.search_status.setText(f"Search failed: {message}")
+        self.search_button.setEnabled(True)
+        self.button_box.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(True)
+
+    def _search_thread_finished(self) -> None:
+        self._search_worker = None
+        self._search_thread = None
+
+    def _result_selection_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        self.apply_button.setEnabled(current is not None)
+
+    @staticmethod
+    def _result_text(result: MetadataResult) -> str:
+        lines = [result.title or "Untitled"]
+        if result.subtitle:
+            lines[0] += f": {result.subtitle}"
+        if result.author:
+            lines.append(f"Author: {result.author}")
+        if result.narrator:
+            lines.append(f"Narrator: {result.narrator}")
+        if result.series_name:
+            sequence = f" #{result.series_number}" if result.series_number else ""
+            lines.append(f"Series: {result.series_name}{sequence}")
+        details = [value for value in (result.published_year, result.publisher, result.isbn, result.source) if value]
+        if result.match_confidence is not None:
+            details.append(f"match {result.match_confidence:.0%}")
+        if details:
+            lines.append("  ·  ".join(details))
+        return "\n".join(lines)
+
+    def _apply_selected(self, *_args) -> None:
+        item = self.results_list.currentItem()
+        result = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if isinstance(result, MetadataResult):
+            self.selected_result = result
+            self.accept()
+
+    def closeEvent(self, event) -> None:
+        if self._search_thread and self._search_thread.isRunning():
+            event.ignore()
+            self.search_status.setText("Wait for the metadata search to finish.")
+            return
+        super().closeEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
@@ -533,24 +704,32 @@ class MainWindow(QMainWindow):
         self.title_edit = QLineEdit()
         self.title_edit.setPlaceholderText("The book title")
         details.addWidget(self.title_edit, 0, 1)
+        self.metadata_search_button = QPushButton("Search metadata…")
+        self.metadata_search_button.clicked.connect(self.search_metadata)
+        details.addWidget(self.metadata_search_button, 0, 2)
         details.addWidget(QLabel("Author"), 1, 0)
         self.author_edit = QLineEdit()
         self.author_edit.setPlaceholderText("Author name")
         details.addWidget(self.author_edit, 1, 1)
         self.metadata_edits: dict[str, QLineEdit] = {"title": self.title_edit, "artist": self.author_edit}
+        details.addWidget(QLabel("ISBN"), 2, 0)
+        self.isbn_edit = QLineEdit()
+        self.isbn_edit.setPlaceholderText("Optional ISBN")
+        self.metadata_edits["isbn"] = self.isbn_edit
+        details.addWidget(self.isbn_edit, 2, 1)
         for row, key, label, placeholder in [
-            (2, "composer", "Narrator", "Narrator name"),
-            (3, "grouping", "Series", "Series name"),
-            (4, "series_number", "Series no.", "Optional"),
-            (5, "date", "Year", "YYYY"),
-            (6, "genre", "Genre", "Optional"),
+            (3, "composer", "Narrator", "Narrator name"),
+            (4, "grouping", "Series", "Series name"),
+            (5, "series_number", "Series no.", "Optional"),
+            (6, "date", "Year", "YYYY"),
+            (7, "genre", "Genre", "Optional"),
         ]:
             details.addWidget(QLabel(label), row, 0)
             edit = QLineEdit()
             edit.setPlaceholderText(placeholder)
             self.metadata_edits[key] = edit
             details.addWidget(edit, row, 1)
-        details.addWidget(QLabel("Cover image"), 7, 0, Qt.AlignmentFlag.AlignTop)
+        details.addWidget(QLabel("Cover image"), 8, 0, Qt.AlignmentFlag.AlignTop)
         cover_row = QVBoxLayout()
         self.cover_drop = CoverDrop()
         self.cover_drop.path_changed.connect(self._cover_changed)
@@ -558,8 +737,8 @@ class MainWindow(QMainWindow):
         cover_button = QPushButton("Browse image")
         cover_button.clicked.connect(self.browse_cover)
         cover_row.addWidget(cover_button)
-        details.addLayout(cover_row, 7, 1)
-        details.addWidget(QLabel("Destination"), 8, 0)
+        details.addLayout(cover_row, 8, 1)
+        details.addWidget(QLabel("Destination"), 9, 0)
         output_row = QHBoxLayout()
         self.output_edit = QLineEdit()
         self.output_edit.setPlaceholderText("Choose a batch destination folder")
@@ -567,24 +746,24 @@ class MainWindow(QMainWindow):
         output_button.clicked.connect(self.browse_output)
         output_row.addWidget(self.output_edit)
         output_row.addWidget(output_button)
-        details.addLayout(output_row, 8, 1)
+        details.addLayout(output_row, 9, 1)
         self.output_edit.textChanged.connect(self._destination_changed)
         self.output_preview = QLabel("Output path appears here after a book is selected.")
         self.output_preview.setWordWrap(True)
         self.output_preview.setObjectName("hint")
-        details.addWidget(self.output_preview, 9, 0, 1, 2)
-        details.addWidget(QLabel("Quality"), 10, 0)
+        details.addWidget(self.output_preview, 10, 0, 1, 3)
+        details.addWidget(QLabel("Quality"), 11, 0)
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(["64 kbps  Small", "96 kbps  Standard", "128 kbps  High", "160 kbps  Very High"])
         self.quality_combo.setCurrentIndex(1)
-        details.addWidget(self.quality_combo, 10, 1)
+        details.addWidget(self.quality_combo, 11, 1)
         self.quality_combo.currentIndexChanged.connect(self._book_settings_changed)
-        details.addWidget(QLabel("Channels"), 11, 0)
+        details.addWidget(QLabel("Channels"), 12, 0)
         self.channel_combo = QComboBox()
         self.channel_combo.addItem("Auto", "Auto")
         self.channel_combo.addItem("Force mono", "Force mono")
         self.channel_combo.addItem("Force stereo", "Force stereo")
-        details.addWidget(self.channel_combo, 11, 1)
+        details.addWidget(self.channel_combo, 12, 1)
         self.channel_combo.currentTextChanged.connect(self._book_settings_changed)
         details.setColumnStretch(1, 1)
         splitter.addWidget(self.details_group)
@@ -984,6 +1163,7 @@ class MainWindow(QMainWindow):
             values = {
                 "title": book.metadata.title,
                 "artist": book.metadata.author,
+                "isbn": book.metadata.isbn,
                 "composer": book.metadata.narrator,
                 "grouping": book.metadata.series,
                 "series_number": book.metadata.series_number,
@@ -1030,6 +1210,13 @@ class MainWindow(QMainWindow):
             series_number=self.metadata_edits["series_number"].text().strip(),
             year=self.metadata_edits["date"].text().strip(),
             genre=self.metadata_edits["genre"].text().strip(),
+            subtitle=book.metadata.subtitle,
+            publisher=book.metadata.publisher,
+            description=book.metadata.description,
+            isbn=self.metadata_edits["isbn"].text().strip(),
+            language=book.metadata.language,
+            tags=book.metadata.tags,
+            rating=book.metadata.rating,
         )
         book.cover = self.cover_drop.path.resolve() if self.cover_drop.path else None
         book.bitrate = [64, 96, 128, 160][self.quality_combo.currentIndex()]
@@ -1098,6 +1285,63 @@ class MainWindow(QMainWindow):
             return
         self.cover = path.resolve()
         self._refresh_output_preview()
+
+    def search_metadata(self) -> None:
+        book = self._selected_book()
+        if book is None:
+            QMessageBox.warning(self, "No book selected", "Add or select an audiobook before searching for metadata.")
+            return
+
+        self._commit_current_book()
+        dialog = MetadataSearchDialog(
+            self,
+            book.metadata.title,
+            book.metadata.author,
+            book.metadata.isbn,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.selected_result is None:
+            return
+
+        result = dialog.selected_result
+        cover_path: Path | None = None
+        if result.cover_url:
+            self.status_label.setText("Downloading selected cover…")
+            QApplication.processEvents()
+            try:
+                cover_path = download_cover(result.cover_url, self._cover_directory(book), result.source_id)
+            except MetadataLookupError as error:
+                QMessageBox.warning(self, "Cover download failed", str(error))
+
+        current = book.metadata
+        book.metadata = BookMetadata(
+            title=result.title or current.title,
+            author=result.author or current.author,
+            narrator=result.narrator or current.narrator,
+            series=result.series_name or current.series,
+            series_number=result.series_number or current.series_number,
+            year=result.published_year or current.year,
+            genre=", ".join(result.genres) or current.genre,
+            subtitle=result.subtitle or current.subtitle,
+            publisher=result.publisher or current.publisher,
+            description=result.description or current.description,
+            isbn=result.isbn or current.isbn,
+            language=result.language or current.language,
+            tags=", ".join(result.tags) or current.tags,
+            rating=result.rating or current.rating,
+        )
+        if cover_path is not None:
+            book.cover = cover_path
+        self._update_book_item()
+        self._load_selected_book()
+        self._refresh_count()
+        self.status_label.setText(f"Applied metadata for {book.display_title}")
+
+    @staticmethod
+    def _cover_directory(book: Book) -> Path:
+        parents = {chapter.path.parent for chapter in book.chapters}
+        if len(parents) == 1:
+            return next(iter(parents))
+        return book.chapters[0].path.parent if book.chapters else Path.cwd()
 
     def browse_cover(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Choose cover image", "", "Images (*.jpg *.jpeg *.png *.webp)")
@@ -1185,6 +1429,13 @@ class MainWindow(QMainWindow):
                     series_number=saved_metadata.get("series_number", ""),
                     year=saved_metadata.get("year", ""),
                     genre=saved_metadata.get("genre", ""),
+                    subtitle=saved_metadata.get("subtitle", ""),
+                    publisher=saved_metadata.get("publisher", ""),
+                    description=saved_metadata.get("description", ""),
+                    isbn=saved_metadata.get("isbn", ""),
+                    language=saved_metadata.get("language", ""),
+                    tags=saved_metadata.get("tags", ""),
+                    rating=saved_metadata.get("rating", ""),
                 )
                 legacy_cover = project_file(payload["cover"]) if payload.get("cover") else None
                 source_name = legacy_metadata.title or (loaded_chapters[0].path.parent.name if loaded_chapters else "Imported book")
@@ -1215,6 +1466,13 @@ class MainWindow(QMainWindow):
                                 series_number=metadata.get("series_number", ""),
                                 year=metadata.get("year", ""),
                                 genre=metadata.get("genre", ""),
+                                subtitle=metadata.get("subtitle", ""),
+                                publisher=metadata.get("publisher", ""),
+                                description=metadata.get("description", ""),
+                                isbn=metadata.get("isbn", ""),
+                                language=metadata.get("language", ""),
+                                tags=metadata.get("tags", ""),
+                                rating=metadata.get("rating", ""),
                             ),
                             cover=project_file(item["cover"]) if item.get("cover") else None,
                             bitrate=item.get("bitrate", 96),

@@ -55,6 +55,9 @@ def metadata_for_book(metadata: BookMetadata) -> dict[str, str]:
         "series_number": metadata.series_number.strip(),
         "date": metadata.year.strip(),
         "genre": metadata.genre.strip(),
+        "comment": metadata.description.strip(),
+        "publisher": metadata.publisher.strip(),
+        "language": metadata.language.strip(),
     }
     return {key: value for key, value in values.items() if value}
 

@@ -52,3 +52,7 @@ Run the build script manually from PowerShell:
 It creates `dist\AudiobookForge.exe` and does not launch it. The script is not connected to the test suite or any automatic build hook. For exporting, place `ffmpeg.exe` and `ffprobe.exe` beside the executable, or configure them from the **Tools** menu.
 
 When FFmpeg is available, the suite includes a short generated MP3/WAV-to-M4B export with cover and metadata verification.
+
+## Online metadata lookup
+
+Select a book and choose **Search metadata…** in the book-details panel to search Google Books and Open Library by title, author, or ISBN. Matching results are validated against the entered title and author before they are shown. Applying a result fills the available bibliographic fields and downloads its cover next to the source audio without replacing an existing file. Narrator and audiobook runtime are not supplied by these general book catalogs and remain available for manual entry.
