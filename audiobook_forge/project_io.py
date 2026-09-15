@@ -5,7 +5,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from .models import Book, BookMetadata, Chapter
+from .models import DEFAULT_OUTPUT_TEMPLATE, Book, BookMetadata, Chapter
 
 
 def save_project(path: Path, chapters: list[Chapter], metadata: BookMetadata, cover: Path | None, output: Path | None, bitrate: int, channel_mode: str) -> None:
@@ -33,7 +33,12 @@ def save_project(path: Path, chapters: list[Chapter], metadata: BookMetadata, co
     _write_payload(path, payload)
 
 
-def save_batch_project(path: Path, books: list[Book], destination_root: Path | None) -> None:
+def save_batch_project(
+    path: Path,
+    books: list[Book],
+    destination_root: Path | None,
+    output_template: str = DEFAULT_OUTPUT_TEMPLATE,
+) -> None:
     """Persist a version 2 multi-book project."""
 
     if not path.parent.exists():
@@ -53,6 +58,7 @@ def save_batch_project(path: Path, books: list[Book], destination_root: Path | N
             for book in books
         ],
         "destination_root": str(destination_root.resolve()) if destination_root else "",
+        "output_template": output_template,
     }
     _write_payload(path, payload)
 
@@ -147,7 +153,12 @@ def _validate_legacy_payload(payload: dict) -> None:
 def _validate_batch_payload(payload: dict) -> None:
     books = payload.get("books")
     destination_root = payload.get("destination_root", "")
-    if not isinstance(books, list) or not isinstance(destination_root, str):
+    output_template = payload.get("output_template", DEFAULT_OUTPUT_TEMPLATE)
+    if (
+        not isinstance(books, list)
+        or not isinstance(destination_root, str)
+        or not isinstance(output_template, str)
+    ):
         raise ValueError("The project is missing valid books or destination root.")
     for index, book in enumerate(books, start=1):
         if not isinstance(book, dict):

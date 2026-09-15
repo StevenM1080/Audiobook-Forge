@@ -21,6 +21,7 @@ from .models import Book, BookMetadata, Chapter, book_output_path
 
 ProgressCallback = Callable[[int, str], None]
 BookFinishedCallback = Callable[[int, Book, Path], None]
+BookProgressCallback = Callable[[int, Book, int, str], None]
 ChannelModeResolvedCallback = Callable[[int], None]
 
 AUTO_STEREO_SAMPLE_SECONDS = 20
@@ -837,6 +838,8 @@ class BatchExportEngine:
         progress: ProgressCallback | None = None,
         book_finished: BookFinishedCallback | None = None,
         channel_mode_resolved: Callable[[int, Book, int], None] | None = None,
+        book_progress: BookProgressCallback | None = None,
+        output_template: str | None = None,
     ) -> None:
         self.books = tuple(books)
         self.destination_root = destination_root
@@ -845,6 +848,8 @@ class BatchExportEngine:
         self.progress = progress or (lambda _value, _message: None)
         self.book_finished = book_finished or (lambda _index, _book, _output: None)
         self.channel_mode_resolved = channel_mode_resolved
+        self.book_progress = book_progress or (lambda _index, _book, _value, _message: None)
+        self.output_template = output_template
         self.completed: list[Path] = []
         self._cancel_event = threading.Event()
         self._current_engine: ExportEngine | None = None
@@ -866,10 +871,16 @@ class BatchExportEngine:
         total_books = len(self.books)
         for index, book in enumerate(self.books):
             self._raise_if_cancelled()
-            output = book_output_path(self.destination_root, book.metadata)
+            output = book_output_path(
+                self.destination_root,
+                book.metadata,
+                self.output_template,
+                book.source_name,
+            )
             created_directories = self._ensure_output_parent(output.parent)
 
-            def book_progress(value: int, message: str, *, book_index: int = index) -> None:
+            def update_book_progress(value: int, message: str, *, book_index: int = index) -> None:
+                self.book_progress(book_index, book, value, message)
                 overall = int(((book_index + min(100, max(0, value)) / 100) / total_books) * 100)
                 self.progress(overall, f"Book {book_index + 1} of {total_books}: {message}")
 
@@ -882,7 +893,7 @@ class BatchExportEngine:
                 book.channel_mode,
                 self.ffmpeg_path,
                 self.ffprobe_path,
-                book_progress,
+                update_book_progress,
                 channel_mode_resolved=(
                     lambda channels, book_index=index, current_book=book: self.channel_mode_resolved(
                         book_index, current_book, channels

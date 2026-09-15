@@ -52,11 +52,12 @@ def test_batch_project_round_trip(tmp_path: Path) -> None:
         )
     ]
 
-    save_batch_project(project, books, tmp_path / "output")
+    save_batch_project(project, books, tmp_path / "output", "{author}/{title}.m4b")
     payload = load_project(project)
 
     assert payload["version"] == 2
     assert payload["destination_root"] == str((tmp_path / "output").resolve())
+    assert payload["output_template"] == "{author}/{title}.m4b"
     assert payload["books"][0]["id"] == "book-id"
     assert payload["books"][0]["metadata"]["series"] == "Series"
     assert payload["books"][0]["bitrate"] == 128

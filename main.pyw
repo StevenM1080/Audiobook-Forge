@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -48,6 +49,7 @@ from audiobook_forge.models import (
     BookMetadata,
     Book,
     Chapter,
+    DEFAULT_OUTPUT_TEMPLATE,
     SUPPORTED_AUDIO_EXTENSIONS,
     estimate_output_bytes,
     book_output_path,
@@ -58,6 +60,13 @@ from audiobook_forge.project_io import load_project, save_batch_project
 from audiobook_forge.metadata import MetadataFinder, MetadataLookupError, MetadataResult, download_cover
 
 AUDIO_EXTENSIONS = SUPPORTED_AUDIO_EXTENSIONS
+OUTPUT_STRUCTURE_PRESETS = (
+    ("Author / Series / Book", DEFAULT_OUTPUT_TEMPLATE),
+    ("Author / Book", "{author}/{book}/{title}.m4b"),
+    ("Book / Title", "{book}/{title}.m4b"),
+    ("Flat files", "{title}.m4b"),
+)
+
 class DropList(QListWidget):
     paths_dropped = Signal(list)
 
@@ -119,6 +128,7 @@ BOOK_ROLE = Qt.ItemDataRole.UserRole
 NUMBER_COLUMN = 0
 TITLE_COLUMN = 1
 DURATION_COLUMN = 2
+PROGRESS_COLUMN = 3
 CHAPTER_TITLE_SOURCE_EMBEDDED = 0
 CHAPTER_TITLE_SOURCE_FILENAME = 1
 CHAPTER_PATH_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -135,8 +145,8 @@ class DropTree(QTreeWidget):
         self.setAcceptDrops(True)
         self.setDragDropMode(QTreeWidget.DragDropMode.InternalMove)
         self.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
-        self.setColumnCount(3)
-        self.setHeaderLabels(["#", "Title", "Duration"])
+        self.setColumnCount(4)
+        self.setHeaderLabels(["#", "Title", "Duration", "Progress"])
         self.setHeaderHidden(False)
         header = self.header()
         header.setSectionsMovable(False)
@@ -144,6 +154,7 @@ class DropTree(QTreeWidget):
         header.setSectionResizeMode(NUMBER_COLUMN, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(TITLE_COLUMN, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(DURATION_COLUMN, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(PROGRESS_COLUMN, QHeaderView.ResizeMode.Interactive)
         self.setIndentation(18)
         self.setAlternatingRowColors(False)
         self.setUniformRowHeights(True)
@@ -157,7 +168,8 @@ class DropTree(QTreeWidget):
         )
         self.setColumnWidth(NUMBER_COLUMN, 76)
         self.setColumnWidth(TITLE_COLUMN, 380)
-        self.setColumnWidth(DURATION_COLUMN, 100)
+        self.setColumnWidth(DURATION_COLUMN, 120)
+        self.setColumnWidth(PROGRESS_COLUMN, 150)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
@@ -312,13 +324,21 @@ class ConversionWorker(QObject):
 
 class BatchConversionWorker(QObject):
     progress = Signal(int, str)
+    book_progress = Signal(str, int, str)
     book_finished = Signal(str, str)
     channel_mode_resolved = Signal(str, int)
     finished = Signal(list)
     failed = Signal(str, int)
     cancelled = Signal(int)
 
-    def __init__(self, books: list[Book], destination_root: Path, ffmpeg_path: str | None, ffprobe_path: str | None) -> None:
+    def __init__(
+        self,
+        books: list[Book],
+        destination_root: Path,
+        ffmpeg_path: str | None,
+        ffprobe_path: str | None,
+        output_template: str | None = None,
+    ) -> None:
         super().__init__()
         self.engine = BatchExportEngine(
             books,
@@ -328,6 +348,8 @@ class BatchConversionWorker(QObject):
             self.progress.emit,
             lambda _index, book, output: self.book_finished.emit(book.book_id, str(output)),
             lambda _index, book, channels: self.channel_mode_resolved.emit(book.book_id, channels),
+            lambda _index, book, value, message: self.book_progress.emit(book.book_id, value, message),
+            output_template,
         )
 
     def cancel(self) -> None:
@@ -398,7 +420,9 @@ class MetadataSearchDialog(QDialog):
         self.search_button = QPushButton("Search books")
         self.search_button.clicked.connect(self.search)
         search_row.addWidget(self.search_button)
-        self.search_status = QLabel("Search Google Books and Open Library by title and author, or enter an ISBN.")
+        self.search_status = QLabel(
+            "Search Google Books, Open Library, and the Library of Congress by title and author, or enter an ISBN."
+        )
         self.search_status.setObjectName("hint")
         search_row.addWidget(self.search_status, 1)
         layout.addLayout(search_row)
@@ -418,6 +442,11 @@ class MetadataSearchDialog(QDialog):
         self.button_box.accepted.connect(self._apply_selected)
         layout.addWidget(self.button_box)
 
+        # Start the initial lookup as soon as the modal is shown.  The search
+        # controls remain editable, so the same button can be used for a new
+        # query without requiring a second dialog action first.
+        QTimer.singleShot(0, self.search)
+
     def search(self) -> None:
         title = self.title_edit.text().strip()
         isbn = self.isbn_edit.text().strip()
@@ -431,7 +460,7 @@ class MetadataSearchDialog(QDialog):
         self.apply_button.setEnabled(False)
         self.search_button.setEnabled(False)
         self.button_box.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(False)
-        self.search_status.setText("Searching Google Books and Open Library…")
+        self.search_status.setText("Searching Google Books, Open Library, and the Library of Congress…")
         thread = QThread(self)
         worker = MetadataSearchWorker(
             title,
@@ -522,6 +551,7 @@ class MainWindow(QMainWindow):
         self._embedded_chapter_titles: dict[Path, str] = {}
         self._use_filename_titles = False
         self._auto_channel_results: dict[str, int] = {}
+        self._book_progress: dict[str, int] = {}
         self._loading_book = False
         self._legacy_chapters_assignment = False
         self.thread: QThread | None = None
@@ -607,6 +637,7 @@ class MainWindow(QMainWindow):
         self.chapter_title_combo.blockSignals(True)
         self.chapter_title_combo.setCurrentIndex(title_source)
         self.chapter_title_combo.blockSignals(False)
+        self._set_output_template(str(self.settings.value("output_template", DEFAULT_OUTPUT_TEMPLATE)))
 
     def _build_menu(self) -> None:
         project_menu = self.menuBar().addMenu("Project")
@@ -661,6 +692,8 @@ class MainWindow(QMainWindow):
         self.file_tree.itemChanged.connect(self._tree_item_changed)
         self.file_tree.itemSelectionChanged.connect(self._tree_selection_changed)
         self.file_tree.structure_changed.connect(self._tree_structure_changed)
+        self.file_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.file_tree.customContextMenuRequested.connect(self._show_tree_context_menu)
         left_layout.addWidget(self.file_tree)
         hint = QLabel("Drop folders or audio files. Expand a book and double-click chapter titles to edit.")
         hint.setObjectName("hint")
@@ -670,14 +703,11 @@ class MainWindow(QMainWindow):
         add_button.clicked.connect(self.browse_audio)
         folder_button = QPushButton("Add folder")
         folder_button.clicked.connect(self.browse_folder)
-        remove_button = QPushButton("Remove selected")
-        remove_button.clicked.connect(self.remove_selected)
         clear_button = QPushButton("Clear")
         clear_button.setObjectName("quietButton")
         clear_button.clicked.connect(self.clear_files)
         row.addWidget(add_button)
         row.addWidget(folder_button)
-        row.addWidget(remove_button)
         row.addWidget(QLabel("Titles:"))
         self.chapter_title_combo = QComboBox()
         self.chapter_title_combo.addItem("Embedded title", CHAPTER_TITLE_SOURCE_EMBEDDED)
@@ -748,22 +778,41 @@ class MainWindow(QMainWindow):
         output_row.addWidget(output_button)
         details.addLayout(output_row, 9, 1)
         self.output_edit.textChanged.connect(self._destination_changed)
+        details.addWidget(QLabel("Structure"), 10, 0)
+        structure_row = QHBoxLayout()
+        self.output_structure_combo = QComboBox()
+        for label, template in OUTPUT_STRUCTURE_PRESETS:
+            self.output_structure_combo.addItem(label, template)
+        self.output_structure_combo.addItem("Custom template", None)
+        self.output_structure_combo.setToolTip("Choose a common folder layout or use a custom template.")
+        structure_row.addWidget(self.output_structure_combo)
+        self.output_template_edit = QLineEdit(DEFAULT_OUTPUT_TEMPLATE)
+        self.output_template_edit.setPlaceholderText(DEFAULT_OUTPUT_TEMPLATE)
+        self.output_template_edit.setToolTip(
+            "Fields: {author}, {series}, {book}, {title}, {series_number}, {narrator}, {year}, {source}. "
+            "Use / or \\ between folders."
+        )
+        structure_row.addWidget(self.output_template_edit, 1)
+        details.addLayout(structure_row, 10, 1, 1, 2)
+        self.output_structure_combo.currentIndexChanged.connect(self._output_structure_preset_changed)
+        self.output_template_edit.textEdited.connect(self._output_template_edited)
+        self.output_template_edit.textChanged.connect(self._output_template_changed)
         self.output_preview = QLabel("Output path appears here after a book is selected.")
         self.output_preview.setWordWrap(True)
         self.output_preview.setObjectName("hint")
-        details.addWidget(self.output_preview, 10, 0, 1, 3)
-        details.addWidget(QLabel("Quality"), 11, 0)
+        details.addWidget(self.output_preview, 11, 0, 1, 3)
+        details.addWidget(QLabel("Quality"), 12, 0)
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(["64 kbps  Small", "96 kbps  Standard", "128 kbps  High", "160 kbps  Very High"])
         self.quality_combo.setCurrentIndex(1)
-        details.addWidget(self.quality_combo, 11, 1)
+        details.addWidget(self.quality_combo, 12, 1)
         self.quality_combo.currentIndexChanged.connect(self._book_settings_changed)
-        details.addWidget(QLabel("Channels"), 12, 0)
+        details.addWidget(QLabel("Channels"), 13, 0)
         self.channel_combo = QComboBox()
         self.channel_combo.addItem("Auto", "Auto")
         self.channel_combo.addItem("Force mono", "Force mono")
         self.channel_combo.addItem("Force stereo", "Force stereo")
-        details.addWidget(self.channel_combo, 12, 1)
+        details.addWidget(self.channel_combo, 13, 1)
         self.channel_combo.currentTextChanged.connect(self._book_settings_changed)
         details.setColumnStretch(1, 1)
         splitter.addWidget(self.details_group)
@@ -977,6 +1026,7 @@ class MainWindow(QMainWindow):
         self._pending_cover = None
         self._embedded_chapter_titles.clear()
         self._auto_channel_results.clear()
+        self._book_progress.clear()
         self.file_tree.clear()
         self._clear_form()
         self._refresh_count()
@@ -986,6 +1036,7 @@ class MainWindow(QMainWindow):
         selected_items = self.file_tree.selectedItems()
         if not selected_items:
             return
+        previous_selected_book_id = self.selected_book_id
         remove_book_ids: set[str] = set()
         remove_chapters: dict[str, set[Path]] = {}
         for item in selected_items:
@@ -1004,11 +1055,32 @@ class MainWindow(QMainWindow):
             if book.chapters:
                 remaining.append(book)
         self.books = remaining
+        remaining_ids = {book.book_id for book in self.books}
+        self._book_progress = {
+            book_id: value for book_id, value in self._book_progress.items() if book_id in remaining_ids
+        }
         for book in self.books:
             book.auto_channel_count = None
         self._auto_channel_results.clear()
-        self.selected_book_id = self.books[0].book_id if self.books else None
+        self.selected_book_id = (
+            previous_selected_book_id
+            if previous_selected_book_id in remaining_ids
+            else (self.books[0].book_id if self.books else None)
+        )
         self._render_books(self.selected_book_id)
+
+    def _show_tree_context_menu(self, position) -> None:
+        item = self.file_tree.itemAt(position)
+        if item is None:
+            return
+        if item not in self.file_tree.selectedItems():
+            self.file_tree.clearSelection()
+            item.setSelected(True)
+            self.file_tree.setCurrentItem(item)
+        menu = QMenu(self)
+        delete_action = menu.addAction("Delete selected")
+        delete_action.triggered.connect(self.remove_selected)
+        menu.exec(self.file_tree.viewport().mapToGlobal(position))
 
     def _render_books(self, preferred_book_id: str | None = None) -> None:
         expanded = {
@@ -1038,6 +1110,15 @@ class MainWindow(QMainWindow):
             book_item.setFont(TITLE_COLUMN, book_font)
             book_item.setFont(DURATION_COLUMN, book_font)
             self.file_tree.addTopLevelItem(book_item)
+            progress_bar = QProgressBar()
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(self._book_progress.get(book.book_id, 0))
+            progress_bar.setTextVisible(True)
+            progress_bar.setFormat("%p%")
+            progress_bar.setFixedHeight(16)
+            progress_bar.setToolTip("Waiting to process")
+            progress_bar.setObjectName("bookProgress")
+            self.file_tree.setItemWidget(book_item, PROGRESS_COLUMN, progress_bar)
             for index, chapter in enumerate(book.chapters, start=1):
                 chapter_item = QTreeWidgetItem(book_item)
                 chapter_item.setText(NUMBER_COLUMN, f"{index:02d}")
@@ -1286,6 +1367,39 @@ class MainWindow(QMainWindow):
         self.cover = path.resolve()
         self._refresh_output_preview()
 
+    def _output_template_changed(self, _value: str) -> None:
+        self.settings.setValue("output_template", self.output_template_edit.text())
+        self._refresh_output_preview()
+
+    def _output_structure_preset_changed(self, index: int) -> None:
+        template = self.output_structure_combo.itemData(index)
+        if isinstance(template, str):
+            self.output_template_edit.setText(template)
+        else:
+            self.output_template_edit.setFocus()
+
+    def _output_template_edited(self, value: str) -> None:
+        preset_index = self.output_structure_combo.findData(value)
+        if preset_index < 0:
+            preset_index = self.output_structure_combo.count() - 1
+        if self.output_structure_combo.currentIndex() != preset_index:
+            self.output_structure_combo.blockSignals(True)
+            self.output_structure_combo.setCurrentIndex(preset_index)
+            self.output_structure_combo.blockSignals(False)
+
+    def _set_output_template(self, value: str) -> None:
+        template = value.strip() or DEFAULT_OUTPUT_TEMPLATE
+        preset_index = self.output_structure_combo.findData(template)
+        if preset_index < 0:
+            preset_index = self.output_structure_combo.count() - 1
+        self.output_structure_combo.blockSignals(True)
+        self.output_structure_combo.setCurrentIndex(preset_index)
+        self.output_structure_combo.blockSignals(False)
+        self.output_template_edit.blockSignals(True)
+        self.output_template_edit.setText(template)
+        self.output_template_edit.blockSignals(False)
+        self._output_template_changed(template)
+
     def search_metadata(self) -> None:
         book = self._selected_book()
         if book is None:
@@ -1367,7 +1481,17 @@ class MainWindow(QMainWindow):
         if not root_text:
             self.output_preview.setText("Choose a destination folder to preview this book's output path.")
             return
-        self.output_preview.setText(str(book_output_path(Path(root_text).expanduser(), book.metadata)))
+        try:
+            output = book_output_path(
+                Path(root_text).expanduser(),
+                book.metadata,
+                self.output_template_edit.text(),
+                book.source_name,
+            )
+        except ValueError as error:
+            self.output_preview.setText(f"Invalid output structure: {error}")
+            return
+        self.output_preview.setText(str(output))
 
     def _destination_changed(self, value: str) -> None:
         self.destination_root = Path(value).expanduser().resolve() if value.strip() else None
@@ -1397,7 +1521,7 @@ class MainWindow(QMainWindow):
         self._sync_tree()
         destination = Path(self.output_edit.text().strip()).expanduser() if self.output_edit.text().strip() else None
         try:
-            save_batch_project(path, self.books, destination)
+            save_batch_project(path, self.books, destination, self.output_template_edit.text().strip())
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Could not save project", str(error))
             return False
@@ -1411,6 +1535,7 @@ class MainWindow(QMainWindow):
         try:
             project_path = Path(path)
             payload = load_project(project_path)
+            loaded_output_template = str(payload.get("output_template", DEFAULT_OUTPUT_TEMPLATE))
 
             def project_file(saved_path: str) -> Path:
                 candidate = Path(saved_path).expanduser()
@@ -1495,6 +1620,7 @@ class MainWindow(QMainWindow):
         self.selected_book_id = self.books[0].book_id if self.books else None
         self.destination_root = loaded_destination
         self.output_edit.setText(str(loaded_destination) if loaded_destination else "")
+        self._set_output_template(loaded_output_template)
         self._render_books(self.selected_book_id)
         self.project_path = Path(path)
         missing = [chapter.path for book in self.books for chapter in book.chapters if not chapter.path.is_file()]
@@ -1561,6 +1687,13 @@ class MainWindow(QMainWindow):
         if not destination.exists() or not destination.is_dir():
             QMessageBox.warning(self, "Missing destination folder", f"The destination folder does not exist:\n{destination}")
             return
+        output_template = self.output_template_edit.text().strip()
+        try:
+            for book in self.books:
+                book_output_path(destination, book.metadata, output_template, book.source_name)
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid output structure", str(error))
+            return
         estimate = sum(
             estimate_output_bytes(sum(chapter.duration for chapter in book.chapters), book.bitrate)
             for book in self.books
@@ -1576,6 +1709,8 @@ class MainWindow(QMainWindow):
                 return
         self._set_exporting(True)
         self.progress.setValue(0)
+        self._book_progress = {book.book_id: 0 for book in self.books}
+        self._update_book_progress_widgets()
         books = deepcopy(self.books)
         thread = QThread(self)
         worker = BatchConversionWorker(
@@ -1583,12 +1718,14 @@ class MainWindow(QMainWindow):
             destination,
             self.settings.value("ffmpeg_path", "") or None,
             self.settings.value("ffprobe_path", "") or None,
+            output_template,
         )
         self.thread = thread
         self.worker = worker
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self.update_progress)
+        worker.book_progress.connect(self.update_book_progress)
         worker.channel_mode_resolved.connect(self._channel_mode_resolved)
         worker.book_finished.connect(self.book_conversion_finished)
         worker.finished.connect(self.conversion_finished)
@@ -1605,6 +1742,27 @@ class MainWindow(QMainWindow):
     def update_progress(self, value: int, message: str) -> None:
         self.progress.setValue(value)
         self.status_label.setText(message)
+
+    def _update_book_progress_widgets(self) -> None:
+        for index in range(self.file_tree.topLevelItemCount()):
+            item = self.file_tree.topLevelItem(index)
+            book_id = str(item.data(NUMBER_COLUMN, BOOK_ROLE) or "")
+            progress_bar = self.file_tree.itemWidget(item, PROGRESS_COLUMN)
+            if isinstance(progress_bar, QProgressBar):
+                progress_bar.setValue(self._book_progress.get(book_id, 0))
+
+    def update_book_progress(self, book_id: str, value: int, message: str) -> None:
+        value = max(0, min(100, value))
+        self._book_progress[book_id] = value
+        for index in range(self.file_tree.topLevelItemCount()):
+            item = self.file_tree.topLevelItem(index)
+            if str(item.data(NUMBER_COLUMN, BOOK_ROLE) or "") != book_id:
+                continue
+            progress_bar = self.file_tree.itemWidget(item, PROGRESS_COLUMN)
+            if isinstance(progress_bar, QProgressBar):
+                progress_bar.setValue(value)
+                progress_bar.setToolTip(message)
+            break
 
     def _set_exporting(self, exporting: bool) -> None:
         self.chapter_group.setEnabled(not exporting)
@@ -1639,6 +1797,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def book_conversion_finished(self, book_id: str, output: str) -> None:
+        self.update_book_progress(book_id, 100, "Audiobook ready")
         book = next((item for item in self.books if item.book_id == book_id), None)
         title = book.display_title if book else Path(output).stem
         self.status_label.setText(f"Saved {title} to {output}")

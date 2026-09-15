@@ -12,7 +12,7 @@ from PySide6.QtGui import QDragEnterEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QHeaderView, QLineEdit, QListWidgetItem, QMainWindow
 
-from audiobook_forge.models import Chapter
+from audiobook_forge.models import Book, BookMetadata, Chapter
 
 
 def _load_main():
@@ -84,16 +84,64 @@ def test_layout_uses_content_minimums_instead_of_a_fixed_window_size(
 
     assert window.output_edit.minimumWidth() >= 180
     header = window.file_tree.header()
-    for index in range(3):
+    for index in range(4):
         assert header.sectionResizeMode(index) == QHeaderView.ResizeMode.Interactive
     assert header.stretchLastSection()
     assert header.length() == header.viewport().width()
     assert header.sectionSize(module.DURATION_COLUMN) > 100
+    assert header.sectionSize(module.PROGRESS_COLUMN) >= 140
     assert window.details_group.width() >= 390
     assert window.output_edit.width() >= window.output_edit.minimumWidth()
     assert window.details_group.height() >= window.details_group.minimumSizeHint().height()
     assert window.chapter_group.width() >= window.chapter_group.minimumSizeHint().width()
     window.close()
+
+
+def test_books_have_individual_progress_and_extended_selection(
+    app: QApplication, tmp_path: Path
+) -> None:
+    module = _load_main()
+    window = _window(module, tmp_path)
+    first = Book(
+        chapters=[Chapter(tmp_path / "one.mp3", "One", 1.0)],
+        metadata=BookMetadata(title="First", author="Author"),
+    )
+    second = Book(
+        chapters=[Chapter(tmp_path / "two.mp3", "Two", 1.0)],
+        metadata=BookMetadata(title="Second", author="Author"),
+    )
+    window.books = [first, second]
+    window.selected_book_id = first.book_id
+    window._render_books(first.book_id)
+
+    assert window.file_tree.selectionMode() == module.QTreeWidget.SelectionMode.ExtendedSelection
+    window.output_structure_combo.setCurrentIndex(window.output_structure_combo.findText("Flat files"))
+    assert window.output_template_edit.text() == "{title}.m4b"
+    progress_bar = window.file_tree.itemWidget(window.file_tree.topLevelItem(0), module.PROGRESS_COLUMN)
+    assert isinstance(progress_bar, module.QProgressBar)
+    window.update_book_progress(first.book_id, 42, "Encoding")
+    assert progress_bar.value() == 42
+    assert progress_bar.toolTip() == "Encoding"
+
+    window.file_tree.topLevelItem(0).setSelected(True)
+    window.file_tree.topLevelItem(1).setSelected(True)
+    window.remove_selected()
+    assert window.books == []
+    window.close()
+
+
+def test_metadata_dialog_starts_search_when_opened(
+    app: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_main()
+    calls: list[bool] = []
+    monkeypatch.setattr(module.MetadataSearchDialog, "search", lambda _dialog: calls.append(True))
+
+    dialog = module.MetadataSearchDialog(None, "Book", "Author", "")
+    app.processEvents()
+
+    assert calls == [True]
+    dialog.close()
 
 
 def test_number_header_aligns_with_indented_chapter_numbers(

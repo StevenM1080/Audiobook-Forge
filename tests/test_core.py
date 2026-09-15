@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from audiobook_forge.exporter import metadata_value
 from audiobook_forge.models import (
     BookMetadata,
@@ -55,3 +57,22 @@ def test_book_output_path_sanitizes_folder_components(tmp_path: Path) -> None:
     output = book_output_path(tmp_path, metadata)
 
     assert output.parent == tmp_path / "Author- Name" / "02 - Book"
+
+
+def test_book_output_path_supports_custom_folder_templates(tmp_path: Path) -> None:
+    metadata = BookMetadata(
+        title="The First Book",
+        author="An Author",
+        series="A Series",
+        series_number="1",
+    )
+
+    assert book_output_path(tmp_path, metadata, "{author}/{title}.m4b") == (
+        tmp_path / "An Author" / "The First Book.m4b"
+    )
+    assert book_output_path(tmp_path, metadata, "{title}") == tmp_path / "The First Book.m4b"
+
+
+def test_book_output_path_rejects_unknown_template_fields(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Unknown output template field"):
+        book_output_path(tmp_path, BookMetadata(title="Book", author="Author"), "{publisher}/{title}.m4b")

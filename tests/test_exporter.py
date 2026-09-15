@@ -515,6 +515,55 @@ def test_batch_export_commits_each_book_before_the_next(
     ]
 
 
+def test_batch_export_reports_per_book_progress_and_uses_output_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "output"
+    destination.mkdir()
+    book = Book(
+        chapters=[Chapter(tmp_path / "one.mp3", "One", 1.0)],
+        metadata=BookMetadata(title="First", author="Author"),
+    )
+    progress: list[tuple[int, str, int, str]] = []
+
+    class FakeEngine:
+        def __init__(self, chapters, output, *_args, **_kwargs) -> None:
+            self.output = output
+            self.book_progress = _args[6]
+
+        def run(self) -> Path:
+            self.book_progress(0, "Starting")
+            self.book_progress(55, "Encoding")
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_bytes(b"completed")
+            self.book_progress(100, "Ready")
+            return self.output
+
+        def cancel(self) -> None:
+            pass
+
+    monkeypatch.setattr(exporter, "ExportEngine", FakeEngine)
+    engine = BatchExportEngine(
+        [book],
+        destination,
+        None,
+        None,
+        book_progress=lambda index, current_book, value, message: progress.append(
+            (index, current_book.display_title, value, message)
+        ),
+        output_template="{author}/{title}.m4b",
+    )
+
+    outputs = engine.run()
+
+    assert outputs == [destination / "Author" / "First.m4b"]
+    assert progress == [
+        (0, "First", 0, "Starting"),
+        (0, "First", 55, "Encoding"),
+        (0, "First", 100, "Ready"),
+    ]
+
+
 @pytest.mark.parametrize("exception", [ExportCancelled, RuntimeError])
 def test_batch_export_stops_after_current_book_and_preserves_completed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exception: type[Exception]

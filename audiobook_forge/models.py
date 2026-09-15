@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
+from string import Formatter
 from uuid import uuid4
 
 
 SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg"}
+DEFAULT_OUTPUT_TEMPLATE = "{author}/{series}/{book}/{title}.m4b"
 
 
 @dataclass
@@ -118,18 +120,67 @@ def safe_folder_name(value: str, fallback: str) -> str:
     return f"{cleaned}-folder" if cleaned.upper() in reserved else cleaned
 
 
-def book_output_path(destination_root: Path, metadata: BookMetadata) -> Path:
-    """Build the deterministic nested destination for one book."""
-
+def _render_output_template(
+    template: str,
+    metadata: BookMetadata,
+    source_name: str = "",
+) -> list[str]:
     author = safe_folder_name(metadata.author, "Unknown Author")
     title = safe_folder_name(metadata.title, "Untitled Book")
-    components = [destination_root, author]
-    if metadata.series.strip():
-        components.append(safe_folder_name(metadata.series, "Series"))
-
+    series = metadata.series.strip()
+    series_value = safe_folder_name(series, "") if series else ""
     series_number = metadata.series_number.strip()
     if series_number.isdigit():
         series_number = f"{int(series_number):02d}"
-    book_folder = f"{series_number} - {title}" if series_number else title
-    components.append(safe_folder_name(book_folder, "Untitled Book"))
-    return Path(*components) / f"{safe_output_stem(metadata.title or title)}.m4b"
+    else:
+        series_number = ""
+    book = f"{series_number} - {title}" if series_number else title
+    values = {
+        "author": author,
+        "series": series_value,
+        "series_number": series_number,
+        "book": safe_folder_name(book, "Untitled Book"),
+        "title": safe_output_stem(metadata.title or title),
+        "narrator": safe_folder_name(metadata.narrator, "") if metadata.narrator.strip() else "",
+        "year": metadata.year.strip(),
+        "source": safe_folder_name(source_name, "") if source_name.strip() else "",
+    }
+    fields: list[str] = []
+    formatter = Formatter()
+    try:
+        for literal, field_name, format_spec, conversion in formatter.parse(template):
+            fields.append(literal)
+            if field_name is None:
+                continue
+            key = field_name.casefold()
+            if key not in values:
+                supported = ", ".join(sorted(values))
+                raise ValueError(f"Unknown output template field {{{field_name}}}. Use: {supported}.")
+            if format_spec or conversion:
+                raise ValueError("Output template fields cannot use format specs or conversions.")
+            fields.append(values[key])
+    except ValueError:
+        raise
+    rendered = "".join(fields).strip()
+    components = [component.strip() for component in re.split(r"[\\/]+", rendered) if component.strip()]
+    if not components:
+        raise ValueError("The output template must produce a file path.")
+    return components
+
+
+def book_output_path(
+    destination_root: Path,
+    metadata: BookMetadata,
+    template: str | None = None,
+    source_name: str = "",
+) -> Path:
+    """Build a sanitized output path from the selected template."""
+
+    selected_template = template.strip() if template and template.strip() else DEFAULT_OUTPUT_TEMPLATE
+    components = _render_output_template(selected_template, metadata, source_name)
+    filename = components.pop()
+    suffix = Path(filename).suffix
+    stem = filename[: -len(suffix)] if suffix else filename
+    safe_filename = f"{safe_output_stem(stem)}.m4b"
+    folders = [safe_folder_name(component, "Folder") for component in components]
+    return destination_root.joinpath(*folders, safe_filename)
