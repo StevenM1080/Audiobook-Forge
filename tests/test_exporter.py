@@ -56,6 +56,24 @@ def test_missing_configured_tool_falls_back_to_a_sibling(
     ) == sibling.resolve()
 
 
+def test_chapter_safe_ffmpeg_selects_a_newer_available_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_ffmpeg = tmp_path / "old-ffmpeg.exe"
+    new_ffmpeg = tmp_path / "new-ffmpeg.exe"
+    old_ffmpeg.write_bytes(b"tool")
+    new_ffmpeg.write_bytes(b"tool")
+    versions = {old_ffmpeg: (4, 4, 0), new_ffmpeg: (7, 1, 4)}
+    monkeypatch.setattr(
+        exporter,
+        "_tool_candidates",
+        lambda *_args, **_kwargs: [old_ffmpeg, new_ffmpeg],
+    )
+    monkeypatch.setattr(exporter, "_tool_version", lambda path: versions[path])
+
+    assert exporter._chapter_safe_ffmpeg(old_ffmpeg, None) == new_ffmpeg.resolve()
+
+
 def test_normalize_command_makes_streams_compatible(tmp_path: Path) -> None:
     command = build_normalize_command(
         Path("ffmpeg"), Path("source.wav"), tmp_path / "chapter.m4a", 128, 2
@@ -78,6 +96,19 @@ def test_mux_command_copies_normalized_audio_and_embeds_cover(tmp_path: Path) ->
     assert "attached_pic" in command
     assert command[command.index("-map_chapters") + 1] == "2"
     assert "-1" not in command
+
+
+def test_mux_command_uses_quicktime_chapters_when_requested(tmp_path: Path) -> None:
+    command = build_mux_command(
+        Path("ffmpeg"),
+        tmp_path / "inputs.txt",
+        tmp_path / "metadata.txt",
+        tmp_path / "book.m4b",
+        None,
+        use_quicktime_chapters=True,
+    )
+
+    assert command[command.index("-movflags") + 1] == "+faststart+disable_chpl"
 
 
 def test_metadata_boundaries_use_cumulative_rounding(tmp_path: Path) -> None:

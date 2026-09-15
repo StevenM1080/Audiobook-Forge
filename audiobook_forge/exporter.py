@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,7 @@ ChannelModeResolvedCallback = Callable[[int], None]
 AUTO_STEREO_SAMPLE_SECONDS = 20
 AUTO_STEREO_SAMPLE_RATE = 16000
 AUTO_STEREO_DIFFERENCE_THRESHOLD = 0.05
+MINIMUM_UNBOUNDED_CHAPTER_FFMPEG = (5, 0, 0)
 
 
 class ExportCancelled(Exception):
@@ -75,6 +77,33 @@ def format_time(seconds: float) -> str:
     )
 
 
+def _tool_candidates(
+    name: str,
+    configured: str | None = None,
+    *,
+    app_path: Path | None = None,
+    sibling_directories: Sequence[Path] = (),
+) -> list[Path]:
+    executable_name = f"{name}.exe" if os.name == "nt" else name
+    application = (app_path or Path(sys.argv[0])).resolve()
+    candidates: list[Path] = [application.parent / executable_name]
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.extend(directory / executable_name for directory in sibling_directories)
+    system_path = shutil.which(name)
+    if system_path:
+        candidates.append(Path(system_path))
+    if os.name == "nt":
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        candidates.extend(
+            Path(directory) / "Jellyfin" / "Server" / executable_name
+            for directory in (program_files, program_files_x86)
+        )
+    candidates.append(Path.home() / ".spotdl" / executable_name)
+    return candidates
+
+
 def discover_tool(
     name: str,
     configured: str | None = None,
@@ -82,16 +111,12 @@ def discover_tool(
     app_path: Path | None = None,
     sibling_directories: Sequence[Path] = (),
 ) -> Path | None:
-    executable_name = f"{name}.exe" if os.name == "nt" else name
-    application = (app_path or Path(sys.argv[0])).resolve()
-    candidates: list[Path] = [application.parent / executable_name]
-    if configured:
-        candidates.append(Path(configured).expanduser())
-    system_path = shutil.which(name)
-    if system_path:
-        candidates.append(Path(system_path))
-    candidates.extend(directory / executable_name for directory in sibling_directories)
-    candidates.append(Path.home() / ".spotdl" / executable_name)
+    candidates = _tool_candidates(
+        name,
+        configured,
+        app_path=app_path,
+        sibling_directories=sibling_directories,
+    )
 
     seen: set[str] = set()
     for candidate in candidates:
@@ -102,6 +127,60 @@ def discover_tool(
         if candidate.is_file():
             return candidate.resolve()
     return None
+
+
+def _tool_version(path: Path) -> tuple[int, ...] | None:
+    try:
+        result = subprocess.run(
+            [str(path), "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"ffmpeg version (\d+(?:\.\d+){0,2})", result.stdout)
+    if not match:
+        return None
+    try:
+        parts = tuple(int(part) for part in match.group(1).split("."))
+        return parts + (0,) * (3 - len(parts))
+    except ValueError:
+        return None
+
+
+def _chapter_safe_ffmpeg(
+    current: Path,
+    configured: str | None,
+    *,
+    app_path: Path | None = None,
+) -> Path:
+    candidates = [current]
+    candidates.extend(
+        _tool_candidates("ffmpeg", configured, app_path=app_path)
+    )
+    seen: set[str] = set()
+    compatible: list[tuple[tuple[int, ...], Path]] = []
+    for candidate in candidates:
+        key = os.path.normcase(os.path.abspath(candidate))
+        if key in seen or not candidate.is_file():
+            continue
+        seen.add(key)
+        version = _tool_version(candidate)
+        if version is not None and version >= MINIMUM_UNBOUNDED_CHAPTER_FFMPEG:
+            compatible.append((version, candidate.resolve()))
+    if compatible:
+        return max(compatible, key=lambda item: item[0])[1]
+    version = _tool_version(current)
+    version_label = ".".join(str(part) for part in version) if version else "unknown"
+    raise RuntimeError(
+        "This book has more than 255 chapters, but the available FFmpeg "
+        f"build ({version_label}) cannot write the required QuickTime chapter track. "
+        "Choose FFmpeg 5.0 or newer from Tools > Choose FFmpeg."
+    )
 
 
 def target_channel_count(
@@ -281,6 +360,8 @@ def build_mux_command(
     metadata_file: Path,
     destination: Path,
     cover: Path | None,
+    *,
+    use_quicktime_chapters: bool = False,
 ) -> list[str]:
     command = [
         str(ffmpeg),
@@ -323,7 +404,7 @@ def build_mux_command(
         ]
     command += [
         "-movflags",
-        "+faststart",
+        "+faststart+disable_chpl" if use_quicktime_chapters else "+faststart",
         "-nostats",
         "-progress",
         "pipe:1",
@@ -537,6 +618,9 @@ class ExportEngine:
                 "FFmpeg was not found. Choose it from Tools > Choose FFmpeg, "
                 "install it on PATH, or place it beside the application."
             )
+        use_quicktime_chapters = len(self.chapters) > 255
+        if use_quicktime_chapters:
+            ffmpeg = _chapter_safe_ffmpeg(ffmpeg, self.ffmpeg_path)
         ffprobe = discover_tool(
             "ffprobe",
             self.ffprobe_path,
@@ -626,6 +710,7 @@ class ExportEngine:
                     metadata_file,
                     staged_output,
                     normalized_cover,
+                    use_quicktime_chapters=use_quicktime_chapters,
                 )
             )
 

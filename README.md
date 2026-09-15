@@ -30,6 +30,8 @@ Batch output is organized as `Destination\Author\[Series]\[Series Number - ]Titl
 
 Each source chapter is normalized to a compatible temporary audio stream before the final M4B is assembled. The completed audiobook is validated in a staging directory and only then replaces the selected destination, so cancellation or conversion failure does not delete an existing audiobook.
 
+Books with more than 255 chapters use FFmpeg's QuickTime chapter track instead of the legacy Nero chapter atom. Audiobook Forge automatically selects a compatible FFmpeg 5.0+ installation when one is available; otherwise it stops before encoding and asks for a newer FFmpeg from the **Tools** menu.
+
 Project files reference the original audio and cover files by absolute path; they do not embed source media. Keep those files available or re-add moved tracks before exporting. New projects use the version 2 multi-book format; version 1 single-book projects are migrated when opened.
 
 ## Test
