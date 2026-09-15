@@ -549,7 +549,8 @@ def test_metadata_search_applies_result_and_downloaded_cover(
     window.search_metadata()
 
     metadata = window.books[0].metadata
-    assert metadata.title == "Matched title"
+    assert metadata.title == "Matched title: A subtitle"
+    assert metadata.subtitle == "A subtitle"
     assert metadata.author == "Matched author"
     assert metadata.narrator == "Matched narrator"
     assert metadata.series == "A series"

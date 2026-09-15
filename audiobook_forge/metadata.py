@@ -48,9 +48,14 @@ class MetadataResult:
 
 
 class GoogleBooksProvider:
-    """Search Google Books volumes without requiring an API key."""
+    """Search Google Books volumes without requiring an API key.
+
+    The public JSON endpoint can throttle clients. Its legacy Atom feed is
+    still useful for public volume searches, so it is used as a fallback.
+    """
 
     endpoint = "https://www.googleapis.com/books/v1/volumes"
+    legacy_endpoint = "https://books.google.com/books/feeds/volumes"
 
     def __init__(self, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> None:
         self.timeout = timeout if timeout > 0 else DEFAULT_TIMEOUT_SECONDS
@@ -72,17 +77,34 @@ class GoogleBooksProvider:
         if not queries:
             return []
 
-        for query in dict.fromkeys(queries):
+        errors: list[MetadataLookupError] = []
+        query_list = list(dict.fromkeys(queries))
+        requested_isbns = set(_isbn_variants(isbn)) if isbn else set()
+        for query in query_list:
             url = f"{self.endpoint}?{urlencode({'q': query, 'maxResults': '10', 'printType': 'books'})}"
-            payload = self._get_json(url)
-            results = []
-            for item in payload.get("items", []) if isinstance(payload, dict) else []:
-                if isinstance(item, dict):
-                    result = self.clean_result(item)
-                    if result.title:
-                        results.append(result)
+            results: list[MetadataResult] = []
+            try:
+                payload = self._get_json(url)
+                for item in payload.get("items", []) if isinstance(payload, dict) else []:
+                    if isinstance(item, dict):
+                        result = self.clean_result(item)
+                        if result.title:
+                            results.append(result)
+            except MetadataLookupError as error:
+                errors.append(error)
+
+            has_exact_isbn = any(
+                result.isbn and requested_isbns.intersection(_isbn_variants(result.isbn))
+                for result in results
+            )
+            if not results or (isbn and not has_exact_isbn):
+                legacy_results = self._legacy_search(query, errors)
+                if legacy_results:
+                    results = legacy_results
             if results:
                 return results
+        if errors and len(errors) >= len(query_list) * 2:
+            raise errors[0]
         return []
 
     def _get_json(self, url: str) -> dict:
@@ -101,6 +123,40 @@ class GoogleBooksProvider:
         if not isinstance(payload, dict):
             raise MetadataLookupError("Google Books returned an invalid response.")
         return payload
+
+    def _legacy_search(
+        self,
+        query: str,
+        errors: list[MetadataLookupError] | None = None,
+    ) -> list[MetadataResult]:
+        url = f"{self.legacy_endpoint}?{urlencode({'q': query, 'max-results': '10'})}"
+        try:
+            root = self._get_xml(url)
+        except MetadataLookupError as error:
+            if errors is not None:
+                errors.append(error)
+            return []
+        return [
+            result
+            for entry in root
+            if _xml_local_name(entry.tag) == "entry"
+            for result in [self.clean_legacy_result(entry)]
+            if result.title
+        ]
+
+    def _get_xml(self, url: str) -> ET.Element:
+        request = Request(
+            url,
+            headers={
+                "Accept": "application/atom+xml, application/xml",
+                "User-Agent": "AudiobookForge/1.0 metadata lookup",
+            },
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                return ET.fromstring(response.read())
+        except (HTTPError, URLError, TimeoutError, OSError, ET.ParseError) as error:
+            raise MetadataLookupError(f"Google Books legacy request failed: {error}") from error
 
     @staticmethod
     def clean_result(item: dict) -> MetadataResult:
@@ -147,11 +203,45 @@ class GoogleBooksProvider:
             source_id=f"google:{str(item.get('id') or '').strip()}",
         )
 
+    @staticmethod
+    def clean_legacy_result(entry: ET.Element) -> MetadataResult:
+        values: dict[str, list[str]] = {}
+        for child in entry.iter():
+            name = _xml_local_name(child.tag)
+            text = _xml_text(child)
+            if text:
+                values.setdefault(name, []).append(text)
+        identifiers = values.get("identifier", [])
+        isbn = _preferred_isbn(
+            [value.split(":", 1)[1] for value in identifiers if value.upper().startswith("ISBN:")]
+        )
+        entry_id = values.get("id", [""])[0].rsplit("/", 1)[-1]
+        return MetadataResult(
+            title=(values.get("title", [""])[-1] or "").strip(),
+            author=", ".join(dict.fromkeys(values.get("creator", []))),
+            published_year=_extract_year((values.get("date", [""])[0] or "").strip()),
+            description=(values.get("description", [""])[0] or "").strip(),
+            cover_url=(
+                f"https://books.google.com/books/content?id={entry_id}&printsec=frontcover&img=1&zoom=1&source=gbs_api"
+                if entry_id
+                else ""
+            ),
+            isbn=isbn,
+            genres=tuple(dict.fromkeys(values.get("subject", []))),
+            language=(values.get("language", [""])[0] or "").strip(),
+            source="Google Books",
+            source_id=f"google:{entry_id}",
+        )
+
 
 class OpenLibraryProvider:
     """Search Open Library editions for identifiers, subjects, and covers."""
 
     endpoint = "https://openlibrary.org/search.json"
+    search_fields = (
+        "key,title,subtitle,author_name,first_publish_year,publisher,isbn,cover_i,"
+        "subject,language,ratings_average,editions"
+    )
 
     def __init__(self, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> None:
         self.timeout = timeout if timeout > 0 else DEFAULT_TIMEOUT_SECONDS
@@ -165,9 +255,21 @@ class OpenLibraryProvider:
 
         if isbn:
             for isbn_value in _isbn_variants(isbn):
+                # Resolve the identifier directly before asking the search
+                # index. Search results are work-level and may return a
+                # different edition of the same series title first.
+                try:
+                    edition = self._get_json(f"https://openlibrary.org/isbn/{isbn_value}.json")
+                except MetadataLookupError:
+                    edition = {}
+                result = self.clean_edition_result(edition)
+                result = self._fill_edition_authors(result, edition)
+                if result.title:
+                    return [result]
+
                 query = {
                     "limit": "10",
-                    "fields": "key,title,subtitle,author_name,first_publish_year,publisher,isbn,cover_i,subject,language,ratings_average",
+                    "fields": self.search_fields,
                     "isbn": isbn_value,
                 }
                 url = f"{self.endpoint}?{urlencode(query)}"
@@ -175,38 +277,62 @@ class OpenLibraryProvider:
                 results = self._search_results(payload)
                 if results:
                     return results
-
-                # The search index can lag behind an edition identifier. The
-                # ISBN endpoint resolves editions directly when an ISBN is
-                # present even if the edition is absent from search results.
-                try:
-                    edition = self._get_json(f"https://openlibrary.org/isbn/{isbn_value}.json")
-                except MetadataLookupError:
-                    continue
-                result = self.clean_edition_result(edition)
-                if result.title:
-                    return [result]
             return []
 
-        query = {
-            "limit": "10",
-            "fields": "key,title,subtitle,author_name,first_publish_year,publisher,isbn,cover_i,subject,language,ratings_average",
-        }
-        if title:
-            query["title"] = title
-        if author:
-            query["author"] = author
-        url = f"{self.endpoint}?{urlencode(query)}"
-        return self._search_results(self._get_json(url))
+        queries: list[dict[str, str]] = []
+        if title and author:
+            queries.append({"title": title, "author": author})
+            queries.append({"q": f"{title} {author}"})
+        elif title:
+            queries.extend(({"title": title}, {"q": title}))
+        elif author:
+            queries.append({"author": author})
+        for query_terms in queries:
+            query = {"limit": "10", "fields": self.search_fields, **query_terms}
+            url = f"{self.endpoint}?{urlencode(query)}"
+            results = self._search_results(self._get_json(url))
+            if results:
+                return results
+        return []
+
+    def _fill_edition_authors(self, result: MetadataResult, edition: dict) -> MetadataResult:
+        if result.author or not isinstance(edition, dict):
+            return result
+        authors = []
+        for author in edition.get("authors") or []:
+            if not isinstance(author, dict):
+                continue
+            key = str(author.get("key") or "").strip()
+            if not key.startswith("/authors/"):
+                continue
+            try:
+                payload = self._get_json(f"https://openlibrary.org{key}.json")
+            except MetadataLookupError:
+                continue
+            name = str(payload.get("name") or "").strip() if isinstance(payload, dict) else ""
+            if name:
+                authors.append(name)
+        return replace(result, author=", ".join(dict.fromkeys(authors))) if authors else result
 
     @classmethod
     def _search_results(cls, payload: dict) -> list[MetadataResult]:
         results = []
         for item in payload.get("docs", []) if isinstance(payload, dict) else []:
-            if isinstance(item, dict):
-                result = cls.clean_result(item)
+            if not isinstance(item, dict):
+                continue
+            editions = item.get("editions")
+            edition_docs = editions.get("docs", []) if isinstance(editions, dict) else []
+            for edition in edition_docs:
+                if not isinstance(edition, dict):
+                    continue
+                edition_item = dict(item)
+                edition_item.update(edition)
+                result = cls.clean_result(edition_item)
                 if result.title:
                     results.append(result)
+            result = cls.clean_result(item)
+            if result.title:
+                results.append(result)
         return results
 
     def _get_json(self, url: str) -> dict:

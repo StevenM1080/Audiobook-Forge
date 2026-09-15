@@ -16,7 +16,7 @@ from pathlib import Path
 from mutagen import File
 
 from .cover import normalize_cover
-from .models import Book, BookMetadata, Chapter, book_output_path
+from .models import Book, BookMetadata, Chapter, book_output_path, title_with_subtitle
 
 
 ProgressCallback = Callable[[int, str], None]
@@ -48,11 +48,12 @@ def metadata_value(value: str) -> str:
 def metadata_for_book(metadata: BookMetadata) -> dict[str, str]:
     """Map application metadata to the common FFmpeg/MP4 tag names."""
 
+    full_title = title_with_subtitle(metadata.title, metadata.subtitle)
     values = {
-        "title": metadata.title.strip(),
+        "title": full_title,
         "artist": metadata.author.strip(),
         "album_artist": metadata.author.strip(),
-        "album": metadata.title.strip(),
+        "album": full_title,
         "composer": metadata.narrator.strip(),
         "grouping": metadata.series.strip(),
         "series_number": metadata.series_number.strip(),

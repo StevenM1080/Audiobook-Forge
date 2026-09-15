@@ -10,6 +10,7 @@ from audiobook_forge.models import (
     natural_sort_key,
     safe_output_stem,
     split_leading_series_number,
+    title_with_subtitle,
 )
 
 
@@ -41,6 +42,11 @@ def test_output_estimate() -> None:
 def test_safe_output_stem_removes_windows_filename_characters() -> None:
     assert safe_output_stem('Book: Part 1 / "Final"') == "Book- Part 1 - -Final-"
     assert safe_output_stem("CON") == "CON-audiobook"
+
+
+def test_title_with_subtitle_keeps_distinguishing_book_part() -> None:
+    assert title_with_subtitle("Awaken Online", "Catharsis") == "Awaken Online: Catharsis"
+    assert title_with_subtitle("Awaken Online: Catharsis", "Catharsis") == "Awaken Online: Catharsis"
 
 
 def test_book_output_path_reuses_author_and_series_folders(tmp_path: Path) -> None:

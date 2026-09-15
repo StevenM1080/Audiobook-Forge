@@ -5,6 +5,7 @@ from audiobook_forge.metadata import (
     GoogleBooksProvider,
     LibraryOfCongressProvider,
     MetadataFinder,
+    MetadataLookupError,
     MetadataResult,
     OpenLibraryProvider,
 )
@@ -39,6 +40,35 @@ def test_google_books_result_is_normalized() -> None:
     assert result.isbn == "9780689839085"
     assert result.cover_url == "https://books.google.com/cover.jpg"
     assert result.source == "Google Books"
+
+
+def test_google_books_legacy_feed_fallback_handles_throttling() -> None:
+    provider = GoogleBooksProvider()
+
+    def fail_json(_url: str) -> dict:
+        raise MetadataLookupError("Google Books request failed: HTTP Error 429")
+
+    provider._get_json = fail_json  # type: ignore[method-assign]
+    provider._get_xml = lambda _url: ET.fromstring(
+        """
+        <feed xmlns="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/terms/">
+          <entry>
+            <id>https://books.google.com/books/feeds/volumes/xxD-zgEACAAJ</id>
+            <title>Side Quest</title>
+            <dc:creator>Travis Bagwell</dc:creator>
+            <dc:date>2021</dc:date>
+            <dc:identifier>ISBN:9798775999988</dc:identifier>
+            <dc:language>en</dc:language>
+          </entry>
+        </feed>
+        """
+    )  # type: ignore[method-assign]
+
+    results = provider.search(isbn="979-8775999988")
+
+    assert results[0].title == "Side Quest"
+    assert results[0].author == "Travis Bagwell"
+    assert results[0].isbn == "9798775999988"
 
 
 def test_open_library_result_is_normalized() -> None:
@@ -91,6 +121,41 @@ def test_open_library_isbn_falls_back_to_direct_edition_lookup() -> None:
     assert results[0].published_year == "2002"
     assert results[0].isbn == "9780689839085"
     assert any("/isbn/9780689839085.json" in url for url in calls)
+
+
+def test_open_library_title_author_search_expands_into_editions() -> None:
+    provider = OpenLibraryProvider()
+
+    def fake_get_json(url: str) -> dict:
+        if "title=Catharsis" in url and "author=Travis" in url:
+            return {"docs": []}
+        return {
+            "docs": [
+                {
+                    "key": "/works/OL21511104W",
+                    "title": "Awaken Online",
+                    "author_name": ["Travis Bagwell"],
+                    "editions": {
+                        "docs": [
+                            {
+                                "key": "/books/OL35673596M",
+                                "title": "Awaken Online",
+                                "subtitle": "Catharsis",
+                                "author_name": ["Travis Bagwell"],
+                                "isbn": ["9781535459426"],
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+
+    provider._get_json = fake_get_json  # type: ignore[method-assign]
+    results = provider.search(title="Catharsis", author="Travis Bagwell")
+
+    assert results[0].title == "Awaken Online"
+    assert results[0].subtitle == "Catharsis"
+    assert results[0].isbn == "9781535459426"
 
 
 def test_library_of_congress_result_is_normalized() -> None:

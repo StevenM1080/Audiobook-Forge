@@ -39,6 +39,18 @@ class BookMetadata:
     rating: str = ""
 
 
+def title_with_subtitle(title: str, subtitle: str) -> str:
+    """Return a title that keeps a meaningful subtitle visible."""
+
+    title = title.strip()
+    subtitle = subtitle.strip()
+    if not title:
+        return subtitle
+    if not subtitle or subtitle.casefold() in title.casefold():
+        return title
+    return f"{title}: {subtitle}"
+
+
 @dataclass
 class Book:
     """One audiobook in a batch project."""
@@ -56,7 +68,11 @@ class Book:
 
     @property
     def display_title(self) -> str:
-        return self.metadata.title.strip() or self.source_name.strip() or "Untitled book"
+        return (
+            title_with_subtitle(self.metadata.title, self.metadata.subtitle)
+            or self.source_name.strip()
+            or "Untitled book"
+        )
 
 
 def split_leading_series_number(value: str) -> tuple[str, str]:
@@ -126,7 +142,8 @@ def _render_output_template(
     source_name: str = "",
 ) -> list[str]:
     author = safe_folder_name(metadata.author, "Unknown Author")
-    title = safe_folder_name(metadata.title, "Untitled Book")
+    full_title = title_with_subtitle(metadata.title, metadata.subtitle)
+    title = safe_folder_name(full_title, "Untitled Book")
     series = metadata.series.strip()
     series_value = safe_folder_name(series, "") if series else ""
     series_number = metadata.series_number.strip()
@@ -140,7 +157,7 @@ def _render_output_template(
         "series": series_value,
         "series_number": series_number,
         "book": safe_folder_name(book, "Untitled Book"),
-        "title": safe_output_stem(metadata.title or title),
+        "title": safe_output_stem(full_title or title),
         "narrator": safe_folder_name(metadata.narrator, "") if metadata.narrator.strip() else "",
         "year": metadata.year.strip(),
         "source": safe_folder_name(source_name, "") if source_name.strip() else "",

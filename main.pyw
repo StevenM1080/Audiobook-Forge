@@ -55,6 +55,7 @@ from audiobook_forge.models import (
     book_output_path,
     natural_sort_key,
     split_leading_series_number,
+    title_with_subtitle,
 )
 from audiobook_forge.project_io import load_project, save_batch_project
 from audiobook_forge.metadata import MetadataFinder, MetadataLookupError, MetadataResult, download_cover
@@ -1427,15 +1428,17 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Cover download failed", str(error))
 
         current = book.metadata
+        title = result.title or current.title
+        subtitle = result.subtitle or current.subtitle
         book.metadata = BookMetadata(
-            title=result.title or current.title,
+            title=title_with_subtitle(title, subtitle),
             author=result.author or current.author,
             narrator=result.narrator or current.narrator,
             series=result.series_name or current.series,
             series_number=result.series_number or current.series_number,
             year=result.published_year or current.year,
             genre=", ".join(result.genres) or current.genre,
-            subtitle=result.subtitle or current.subtitle,
+            subtitle=subtitle,
             publisher=result.publisher or current.publisher,
             description=result.description or current.description,
             isbn=result.isbn or current.isbn,
